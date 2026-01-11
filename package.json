@@ -1,0 +1,26 @@
+{
+  "name": "polybot",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "discover": "bun bot/index.ts discover",
+    "auto": "bun bot/index.ts auto",
+    "add": "bun bot/index.ts add",
+    "list": "bun bot/index.ts list",
+    "analyze": "bun bot/index.ts analyze",
+    "start": "bun bot/index.ts start",
+    "setup": "bun bot/index.ts setup",
+    "dev": "bun --watch bot/index.ts start"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.2.0",
+    "ethers": "5"
+  }
+}
