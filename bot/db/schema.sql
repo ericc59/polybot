@@ -153,6 +153,28 @@ CREATE TABLE IF NOT EXISTS user_copy_subscriptions (
   PRIMARY KEY(user_id, source_wallet)
 );
 
+-- Copy trade execution history
+CREATE TABLE IF NOT EXISTS copy_trade_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  source_wallet TEXT NOT NULL,
+  source_trade_hash TEXT NOT NULL,
+  market_condition_id TEXT NOT NULL,
+  market_title TEXT,
+  side TEXT NOT NULL,
+  size REAL NOT NULL,
+  price REAL NOT NULL,
+  status TEXT DEFAULT 'pending',
+  order_id TEXT,
+  tx_hash TEXT,
+  error_message TEXT,
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),
+  executed_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_copy_trade_history_user ON copy_trade_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_copy_trade_history_source ON copy_trade_history(source_trade_hash);
+
 -- =============================================
 -- SCHEMA VERSION
 -- =============================================
