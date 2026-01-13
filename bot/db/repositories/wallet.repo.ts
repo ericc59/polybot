@@ -20,6 +20,9 @@ export interface WalletSubscriber {
   maxAlertsPerHour: number;
   quietHoursStart: number | null;
   quietHoursEnd: number | null;
+  // Tier limits
+  tierMaxAlertsPerDay: number;
+  tierCanUseCopyTrading: number;
 }
 
 // Add wallet subscription for user
@@ -130,10 +133,13 @@ export async function getWalletSubscribers(walletAddress: string): Promise<Walle
       us.alert_whale_type_sniper as alertWhaleTypeSniper,
       us.max_alerts_per_hour as maxAlertsPerHour,
       us.quiet_hours_start as quietHoursStart,
-      us.quiet_hours_end as quietHoursEnd
+      us.quiet_hours_end as quietHoursEnd,
+      st.max_alerts_per_day as tierMaxAlertsPerDay,
+      st.can_use_copy_trading as tierCanUseCopyTrading
     FROM user_wallets uw
     JOIN users u ON uw.user_id = u.id
     JOIN user_settings us ON u.id = us.user_id
+    JOIN subscription_tiers st ON u.subscription_tier = st.id
     WHERE uw.wallet_address = ?
       AND uw.notify_enabled = 1
       AND u.is_active = 1
@@ -147,13 +153,33 @@ export async function getWalletSubscribers(walletAddress: string): Promise<Walle
 export async function getAllTrackedWalletAddresses(): Promise<string[]> {
   const db = await getDb();
 
-  const rows = db.query(`
+  // Get wallets from user_wallets (regular tracking)
+  const regularWallets = db.query(`
     SELECT DISTINCT wallet_address
     FROM user_wallets
     WHERE notify_enabled = 1
   `).all() as { wallet_address: string }[];
 
-  return rows.map((r) => r.wallet_address);
+  // Also get wallets from paper trading portfolios
+  let paperWallets: { wallet_address: string }[] = [];
+  try {
+    paperWallets = db.query(`
+      SELECT DISTINCT ppw.wallet_address
+      FROM paper_portfolio_wallets ppw
+      JOIN paper_portfolios pp ON ppw.portfolio_id = pp.id
+      WHERE pp.is_active = 1
+    `).all() as { wallet_address: string }[];
+  } catch {
+    // Table may not exist yet, ignore
+  }
+
+  // Combine and deduplicate
+  const allAddresses = new Set([
+    ...regularWallets.map((r) => r.wallet_address),
+    ...paperWallets.map((r) => r.wallet_address),
+  ]);
+
+  return Array.from(allAddresses);
 }
 
 // Update wallet stats for a user's subscription

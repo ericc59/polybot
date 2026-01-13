@@ -138,6 +138,10 @@ async function pollWallet(address: string, isSeedPass: boolean): Promise<void> {
         pnlPerTrade: walletStats.pnl_per_trade,
         tradeFrequency: walletStats.trade_frequency,
         whaleType: walletStats.whale_type as "active" | "dormant" | "sniper",
+        takerRatio: 0,
+        takerVolume: 0,
+        makerVolume: 0,
+        categoryBreakdown: [],
       },
     });
   }

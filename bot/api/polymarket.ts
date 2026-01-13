@@ -176,3 +176,65 @@ export async function getTopTraders(): Promise<string[]> {
 
   return Array.from(wallets);
 }
+
+// Market details
+export interface Market {
+  id: string;
+  conditionId: string;
+  slug: string;
+  title: string;
+  description: string;
+  outcomes: string[];
+  outcomePrices: string[];
+  volume: string;
+  liquidity: string;
+  endDate: string;
+  createdAt: string;
+  closed: boolean;
+  resolved: boolean;
+  resolutionSource?: string;
+  category?: string;
+}
+
+// Fetch market details from Gamma API
+export async function getMarket(conditionId: string): Promise<Market | null> {
+  try {
+    const url = new URL(`/markets/${conditionId}`, config.GAMMA_API);
+    const response = await fetch(url.toString());
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return (await response.json()) as Market;
+  } catch (error) {
+    return null;
+  }
+}
+
+// Search markets by slug or title
+export async function searchMarkets(query: string, limit = 10): Promise<Market[]> {
+  try {
+    const url = new URL("/markets", config.GAMMA_API);
+    url.searchParams.set("_limit", String(limit));
+    url.searchParams.set("closed", "false");
+
+    const response = await fetch(url.toString());
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const markets = (await response.json()) as Market[];
+
+    // Filter by query
+    const q = query.toLowerCase();
+    return markets.filter(
+      (m) =>
+        m.slug?.toLowerCase().includes(q) ||
+        m.title?.toLowerCase().includes(q)
+    );
+  } catch (error) {
+    return [];
+  }
+}

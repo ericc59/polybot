@@ -2,26 +2,33 @@ import { Database } from "bun:sqlite";
 import { config } from "../config";
 import { logger } from "../utils/logger";
 
-let db: Database | null = null;
+let _db: Database | null = null;
+
+export function db(): Database {
+  if (!_db) {
+    throw new Error("Database not initialized. Call getDb() first.");
+  }
+  return _db;
+}
 
 export async function getDb(): Promise<Database> {
-  if (db) return db;
+  if (_db) return _db;
 
   // Ensure data directory exists
   const dataDir = config.DB_PATH.substring(0, config.DB_PATH.lastIndexOf("/"));
   await Bun.write(`${dataDir}/.gitkeep`, "");
 
-  db = new Database(config.DB_PATH);
+  _db = new Database(config.DB_PATH);
 
   // Enable WAL mode for better concurrent performance
-  db.run("PRAGMA journal_mode=WAL");
-  db.run("PRAGMA foreign_keys=ON");
+  _db.run("PRAGMA journal_mode=WAL");
+  _db.run("PRAGMA foreign_keys=ON");
 
   // Run migrations
-  await runMigrations(db);
+  await runMigrations(_db);
 
   logger.info(`Database initialized at ${config.DB_PATH}`);
-  return db;
+  return _db;
 }
 
 async function runMigrations(database: Database) {
@@ -59,9 +66,9 @@ async function runMigrations(database: Database) {
 
 // Close database connection
 export function closeDb() {
-  if (db) {
-    db.close();
-    db = null;
+  if (_db) {
+    _db.close();
+    _db = null;
   }
 }
 

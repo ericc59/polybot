@@ -1,4 +1,4 @@
--- Polymarket Wallet Tracker - Multi-User Schema
+-- PolySpy - Multi-User Schema
 -- Version: 1.0.0
 
 -- =============================================

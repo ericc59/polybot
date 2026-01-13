@@ -80,10 +80,33 @@ export async function countRecentAlerts(userId: number, windowMinutes = 60): Pro
   return row.count;
 }
 
-// Check if user is rate limited
+// Check if user is rate limited (hourly)
 export async function isRateLimited(userId: number, maxPerHour: number): Promise<boolean> {
   const count = await countRecentAlerts(userId, 60);
   return count >= maxPerHour;
+}
+
+// Count alerts sent today (for daily tier limits)
+export async function countTodayAlerts(userId: number): Promise<number> {
+  const db = await getDb();
+
+  const todayStart = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+
+  const row = db
+    .query(
+      `SELECT COUNT(*) as count
+       FROM alert_history
+       WHERE user_id = ? AND sent_at >= ?`
+    )
+    .get(userId, todayStart) as { count: number };
+
+  return row.count;
+}
+
+// Check if user has exceeded daily tier limit
+export async function isDailyLimitExceeded(userId: number, maxPerDay: number): Promise<boolean> {
+  const count = await countTodayAlerts(userId);
+  return count >= maxPerDay;
 }
 
 // Clean up old seen trades (older than 7 days)

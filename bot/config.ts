@@ -13,6 +13,9 @@ export const config = {
   WEBHOOK_URL: process.env.WEBHOOK_URL || "", // e.g., https://polybot.example.com
   USE_WEBHOOK: process.env.USE_WEBHOOK === "true",
 
+  // Monitor mode: real-time WebSocket (default) or polling
+  USE_POLLING: process.env.USE_POLLING === "true", // Set to true to use slow polling instead of WebSocket
+
   // Wallet tracking settings (defaults, users can override)
   POLL_INTERVAL_MS: Number(process.env.POLL_INTERVAL_MS) || 60000, // 1 minute
   MIN_WALLET_PNL: Number(process.env.MIN_WALLET_PNL) || 10000, // Min $10k profit to track
@@ -22,6 +25,15 @@ export const config = {
 
   // Database
   DB_PATH: process.env.DB_PATH || "./data/polybot.db",
+
+  // Stripe
+  STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY || "",
+  STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET || "",
+  STRIPE_PRO_PRICE_ID: process.env.STRIPE_PRO_PRICE_ID || "",
+  STRIPE_ENTERPRISE_PRICE_ID: process.env.STRIPE_ENTERPRISE_PRICE_ID || "",
+
+  // Admin
+  ADMIN_TELEGRAM_IDS: (process.env.ADMIN_TELEGRAM_IDS || "").split(",").filter(Boolean),
 };
 
 export function validateConfig(): { valid: boolean; missing: string[] } {

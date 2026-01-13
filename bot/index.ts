@@ -1,17 +1,27 @@
 import { config, validateConfig } from "./config";
 import { getDb } from "./db/index";
 import {
-  testConnection,
-  startPolling,
-  setupWebhook,
-  createWebhookHandler,
-  handleUpdate,
-} from "./telegram/index";
-import { startMonitor, stopMonitor, getMonitorStatus } from "./services/monitor.service";
+	getMonitorStatus,
+	startMonitor,
+	stopMonitor,
+} from "./services/monitor.service";
 import {
-  analyzeWallet,
-  discoverProfitableWallets,
-  formatWalletScore,
+	getRealtimeStatus,
+	startRealtimeMonitor,
+	stopRealtimeMonitor,
+} from "./services/realtime.service";
+import * as stripeService from "./services/stripe.service";
+import {
+	createWebhookHandler,
+	handleUpdate,
+	setupWebhook,
+	startPolling,
+	testConnection,
+} from "./telegram/index";
+import {
+	analyzeWallet,
+	discoverProfitableWallets,
+	formatWalletScore,
 } from "./tracker/analyzer";
 import { logger } from "./utils/logger";
 
@@ -19,152 +29,203 @@ const args = process.argv.slice(2);
 const command = args[0] || "help";
 
 async function main() {
-  console.log(`
+	console.log(`
 ======================================
-  POLYMARKET WHALE TRACKER (Multi-User)
+  POLYSPY (Multi-User)
 ======================================
 `);
 
-  switch (command) {
-    case "start":
-      await runStart();
-      break;
-    case "discover":
-      await runDiscover();
-      break;
-    case "analyze":
-      await runAnalyze(args[1]);
-      break;
-    case "setup":
-      runSetup();
-      break;
-    default:
-      printHelp();
-  }
+	switch (command) {
+		case "start":
+			await runStart();
+			break;
+		case "discover":
+			await runDiscover();
+			break;
+		case "analyze":
+			await runAnalyze(args[1]);
+			break;
+		case "setup":
+			runSetup();
+			break;
+		default:
+			printHelp();
+	}
 }
 
 async function runStart() {
-  const { valid, missing } = validateConfig();
+	const { valid, missing } = validateConfig();
 
-  if (!valid) {
-    logger.error(`Missing config: ${missing.join(", ")}`);
-    logger.info("Run 'bun bot/index.ts setup' for instructions");
-    process.exit(1);
-  }
+	if (!valid) {
+		logger.error(`Missing config: ${missing.join(", ")}`);
+		logger.info("Run 'bun bot/index.ts setup' for instructions");
+		process.exit(1);
+	}
 
-  // Test Telegram connection
-  const telegramOk = await testConnection();
-  if (!telegramOk) {
-    logger.error("Telegram connection failed - check TELEGRAM_BOT_TOKEN");
-    process.exit(1);
-  }
+	// Test Telegram connection
+	const telegramOk = await testConnection();
+	if (!telegramOk) {
+		logger.error("Telegram connection failed - check TELEGRAM_BOT_TOKEN");
+		process.exit(1);
+	}
 
-  logger.success("Telegram connection OK");
+	logger.success("Telegram connection OK");
 
-  // Initialize database
-  await getDb();
-  logger.success("Database initialized");
+	// Initialize database
+	await getDb();
+	logger.success("Database initialized");
 
-  // Start monitor service
-  startMonitor();
+	// Start real-time WebSocket monitor (with polling fallback)
+	if (config.USE_POLLING) {
+		logger.info("Starting polling monitor (USE_POLLING=true)...");
+		startMonitor();
+	} else {
+		logger.info("Starting real-time WebSocket monitor...");
+		await startRealtimeMonitor();
+	}
 
-  // Start Telegram bot
-  if (config.USE_WEBHOOK) {
-    // Webhook mode - start HTTP server
-    await setupWebhook(`${config.WEBHOOK_URL}/telegram`);
+	// Start HTTP server (always runs for health checks and Stripe webhooks)
+	Bun.serve({
+		port: config.PORT,
+		async fetch(req) {
+			const url = new URL(req.url);
 
-    Bun.serve({
-      port: config.PORT,
-      async fetch(req) {
-        const url = new URL(req.url);
+			// Telegram webhook (only in webhook mode)
+			if (url.pathname === "/telegram" && req.method === "POST") {
+				if (!config.USE_WEBHOOK) {
+					return new Response("Webhook mode not enabled", { status: 404 });
+				}
+				return createWebhookHandler()(req);
+			}
 
-        if (url.pathname === "/telegram" && req.method === "POST") {
-          return createWebhookHandler()(req);
-        }
+			// Health check
+			if (url.pathname === "/health") {
+				const monitorStatus = config.USE_POLLING
+					? getMonitorStatus()
+					: getRealtimeStatus();
+				return new Response(
+					JSON.stringify({
+						status: "ok",
+						monitor: monitorStatus,
+						monitorMode: config.USE_POLLING ? "polling" : "realtime",
+						telegramMode: config.USE_WEBHOOK ? "webhook" : "polling",
+					}),
+					{ headers: { "Content-Type": "application/json" } },
+				);
+			}
 
-        if (url.pathname === "/health") {
-          const status = getMonitorStatus();
-          return new Response(
-            JSON.stringify({
-              status: "ok",
-              monitor: status,
-            }),
-            { headers: { "Content-Type": "application/json" } }
-          );
-        }
+			// Stripe webhook endpoint
+			if (url.pathname === "/stripe/webhook" && req.method === "POST") {
+				const payload = await req.text();
+				const signature = req.headers.get("stripe-signature");
 
-        return new Response("Not found", { status: 404 });
-      },
-    });
+				if (!signature) {
+					return new Response("Missing stripe-signature header", {
+						status: 400,
+					});
+				}
 
-    logger.success(`Webhook server running on port ${config.PORT}`);
-  } else {
-    // Polling mode - long polling for updates
-    logger.info("Starting in polling mode...");
-    startPolling();
-  }
+				const result = await stripeService.handleWebhookEvent(
+					payload,
+					signature,
+				);
 
-  logger.success("Bot is running! Send /start in Telegram to register.");
+				if (!result.success) {
+					return new Response("Webhook verification failed", { status: 400 });
+				}
 
-  // Handle graceful shutdown
-  process.on("SIGINT", () => {
-    logger.info("Shutting down...");
-    stopMonitor();
-    process.exit(0);
-  });
+				return new Response(
+					JSON.stringify({ received: true, event: result.event }),
+					{
+						headers: { "Content-Type": "application/json" },
+					},
+				);
+			}
 
-  process.on("SIGTERM", () => {
-    logger.info("Shutting down...");
-    stopMonitor();
-    process.exit(0);
-  });
+			return new Response("Not found", { status: 404 });
+		},
+	});
+
+	logger.success(`HTTP server running on port ${config.PORT}`);
+
+	// Start Telegram bot
+	if (config.USE_WEBHOOK) {
+		await setupWebhook(`${config.WEBHOOK_URL}/telegram`);
+		logger.success("Telegram webhook configured");
+	} else {
+		logger.info("Starting Telegram in polling mode...");
+		startPolling();
+	}
+
+	logger.success("Bot is running! Send /start in Telegram to register.");
+
+	// Handle graceful shutdown
+	process.on("SIGINT", () => {
+		logger.info("Shutting down...");
+		if (config.USE_POLLING) {
+			stopMonitor();
+		} else {
+			stopRealtimeMonitor();
+		}
+		process.exit(0);
+	});
+
+	process.on("SIGTERM", () => {
+		logger.info("Shutting down...");
+		if (config.USE_POLLING) {
+			stopMonitor();
+		} else {
+			stopRealtimeMonitor();
+		}
+		process.exit(0);
+	});
 }
 
 async function runDiscover() {
-  logger.info("Discovering profitable wallets...");
-  logger.info(
-    `Min PnL: $${config.MIN_WALLET_PNL}, Min Win Rate: ${config.MIN_WIN_RATE * 100}%`
-  );
+	logger.info("Discovering profitable wallets...");
+	logger.info(
+		`Min PnL: $${config.MIN_WALLET_PNL}, Min Win Rate: ${config.MIN_WIN_RATE * 100}%`,
+	);
 
-  const wallets = await discoverProfitableWallets(20);
+	const wallets = await discoverProfitableWallets(20);
 
-  if (wallets.length === 0) {
-    logger.warn("No wallets found matching criteria. Try lowering thresholds.");
-    return;
-  }
+	if (wallets.length === 0) {
+		logger.warn("No wallets found matching criteria. Try lowering thresholds.");
+		return;
+	}
 
-  console.log(`\nFound ${wallets.length} profitable wallets:\n`);
+	console.log(`\nFound ${wallets.length} profitable wallets:\n`);
 
-  for (const wallet of wallets) {
-    console.log("-".repeat(50));
-    console.log(formatWalletScore(wallet));
-  }
+	for (const wallet of wallets) {
+		console.log("-".repeat(50));
+		console.log(formatWalletScore(wallet));
+	}
 
-  console.log("\n" + "-".repeat(50));
-  console.log("\nUsers can add wallets via /add command in Telegram");
+	console.log("\n" + "-".repeat(50));
+	console.log("\nUsers can add wallets via /add command in Telegram");
 }
 
 async function runAnalyze(address?: string) {
-  if (!address) {
-    logger.error("Usage: bun bot/index.ts analyze <wallet-address>");
-    return;
-  }
+	if (!address) {
+		logger.error("Usage: bun bot/index.ts analyze <wallet-address>");
+		return;
+	}
 
-  logger.info(`Analyzing wallet ${address}...`);
+	logger.info(`Analyzing wallet ${address}...`);
 
-  const score = await analyzeWallet(address);
+	const score = await analyzeWallet(address);
 
-  if (!score) {
-    logger.error("Could not analyze wallet");
-    return;
-  }
+	if (!score) {
+		logger.error("Could not analyze wallet");
+		return;
+	}
 
-  console.log("\n" + formatWalletScore(score));
+	console.log("\n" + formatWalletScore(score));
 }
 
 function runSetup() {
-  console.log(`
-POLYMARKET WHALE TRACKER SETUP (Multi-User)
+	console.log(`
+POLYSPY SETUP (Multi-User)
 ============================================
 
 1. CREATE A TELEGRAM BOT
@@ -215,7 +276,7 @@ TELEGRAM COMMANDS FOR USERS
 }
 
 function printHelp() {
-  console.log(`
+	console.log(`
 USAGE: bun bot/index.ts <command>
 
 COMMANDS:
@@ -240,6 +301,6 @@ TELEGRAM COMMANDS (once bot is running):
 }
 
 main().catch((error) => {
-  logger.error("Fatal error", error);
-  process.exit(1);
+	logger.error("Fatal error", error);
+	process.exit(1);
 });

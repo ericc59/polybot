@@ -1,6 +1,8 @@
 import { sendMessage, createInlineKeyboard } from "../telegram/index";
 import * as walletRepo from "../db/repositories/wallet.repo";
 import * as alertRepo from "../db/repositories/alert.repo";
+import * as copyService from "./copy.service";
+import * as paperService from "./paper.service";
 import { logger } from "../utils/logger";
 import type { Trade } from "../api/polymarket";
 import type { WalletScore } from "../tracker/analyzer";
@@ -169,11 +171,6 @@ function formatAlertMessage(
 // Dispatch alerts to all subscribed users for a trade
 export async function dispatchAlerts(event: TradeEvent): Promise<number> {
   const subscribers = await walletRepo.getWalletSubscribers(event.walletAddress);
-
-  if (subscribers.length === 0) {
-    return 0;
-  }
-
   const tradeHash = generateTradeHash(event.trade);
   let sent = 0;
 
@@ -185,10 +182,17 @@ export async function dispatchAlerts(event: TradeEvent): Promise<number> {
         continue;
       }
 
-      // Check rate limit
-      const isLimited = await alertRepo.isRateLimited(subscriber.userId, subscriber.maxAlertsPerHour);
-      if (isLimited) {
-        logger.warn(`Rate limited user ${subscriber.userId}`);
+      // Check hourly rate limit
+      const isHourlyLimited = await alertRepo.isRateLimited(subscriber.userId, subscriber.maxAlertsPerHour);
+      if (isHourlyLimited) {
+        logger.warn(`Hourly rate limited user ${subscriber.userId}`);
+        continue;
+      }
+
+      // Check daily tier limit
+      const isDailyLimited = await alertRepo.isDailyLimitExceeded(subscriber.userId, subscriber.tierMaxAlertsPerDay);
+      if (isDailyLimited) {
+        logger.warn(`Daily tier limit exceeded for user ${subscriber.userId}`);
         continue;
       }
 
@@ -202,11 +206,20 @@ export async function dispatchAlerts(event: TradeEvent): Promise<number> {
       // Format and send message
       const message = formatAlertMessage(subscriber, event);
 
-      // Create action buttons
+      // Create action buttons with copy trade link
+      const tradeSize = parseFloat(event.trade.size) * parseFloat(event.trade.price);
+      const copyText = `Copy $${tradeSize.toFixed(0)} ${event.trade.side}`;
+
       const keyboard = createInlineKeyboard([
         [
           {
             text: "View on Polymarket",
+            url: `https://polymarket.com/event/${event.trade.slug || ""}`,
+          },
+        ],
+        [
+          {
+            text: copyText,
             url: `https://polymarket.com/event/${event.trade.slug || ""}`,
           },
         ],
@@ -238,6 +251,28 @@ export async function dispatchAlerts(event: TradeEvent): Promise<number> {
 
   if (sent > 0) {
     logger.info(`Dispatched ${sent} alerts for trade ${tradeHash.slice(0, 16)}...`);
+  }
+
+  // Process copy trades for subscribers in auto/recommend mode
+  try {
+    const copyStats = await copyService.processCopyTrade(event.walletAddress, event.trade, tradeHash);
+    if (copyStats.recommended > 0 || copyStats.executed > 0) {
+      logger.info(`Copy trading: ${copyStats.recommended} recommended, ${copyStats.executed} executed, ${copyStats.failed} failed`);
+    }
+  } catch (error) {
+    logger.error("Failed to process copy trades", error);
+  }
+
+  // Process paper trades for users simulating this wallet
+  try {
+    const paperStats = await paperService.processPaperTradesForWallet(event.walletAddress, event.trade);
+    if (paperStats.processed > 0 || paperStats.failed > 0) {
+      logger.info(`Paper trading: ${paperStats.processed} processed, ${paperStats.failed} failed`);
+    } else {
+      logger.debug(`Paper trading: No active paper portfolios tracking ${event.walletAddress.slice(0, 10)}...`);
+    }
+  } catch (error) {
+    logger.error("Failed to process paper trades", error);
   }
 
   return sent;
