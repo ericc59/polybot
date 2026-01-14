@@ -296,13 +296,13 @@ async function handleAdd(
 
 	// Check tier limits
 	const walletCount = await walletRepo.countUserWallets(user.id);
-	if (walletCount >= user.tier.max_wallets) {
-		await sendMessage(
-			chatId,
-			`You've reached the limit of ${user.tier.max_wallets} wallets on the ${user.tier.name} plan.`,
-		);
-		return;
-	}
+	// if (walletCount >= user.tier.max_wallets) {
+	// 	await sendMessage(
+	// 		chatId,
+	// 		`You've reached the limit of ${user.tier.max_wallets} wallets on the ${user.tier.name} plan.`,
+	// 	);
+	// 	return;
+	// }
 
 	// Check if already subscribed
 	if (await walletRepo.isSubscribed(user.id, address)) {
@@ -1321,7 +1321,10 @@ async function handlePaper(
 			const amount = parseFloat(args[1] || "10000");
 
 			if (isNaN(amount) || amount < 100) {
-				await sendMessage(chatId, "Amount must be at least $100\n\nUsage: /paper start [amount]");
+				await sendMessage(
+					chatId,
+					"Amount must be at least $100\n\nUsage: /paper start [amount]",
+				);
 				return;
 			}
 
@@ -1341,7 +1344,10 @@ async function handlePaper(
 		case "add": {
 			const wallet = args[1]?.toLowerCase();
 			if (!wallet || !isValidAddress(wallet)) {
-				await sendMessage(chatId, "Usage: /paper add <wallet>\n\nExample: /paper add 0x123...");
+				await sendMessage(
+					chatId,
+					"Usage: /paper add <wallet>\n\nExample: /paper add 0x123...",
+				);
 				return;
 			}
 
@@ -1368,7 +1374,11 @@ async function handlePaper(
 
 			const result = paperService.removeWalletFromPortfolio(user.id, wallet);
 			if (result.success) {
-				await sendMessage(chatId, `Removed \`${wallet.slice(0, 10)}...\` from paper portfolio.`, { parseMode: "Markdown" });
+				await sendMessage(
+					chatId,
+					`Removed \`${wallet.slice(0, 10)}...\` from paper portfolio.`,
+					{ parseMode: "Markdown" },
+				);
 			} else {
 				await sendMessage(chatId, `Failed: ${result.error}`);
 			}
@@ -1408,14 +1418,18 @@ async function handlePaper(
 		case "history": {
 			const trades = paperService.getPaperTradeHistory(user.id, 15);
 			if (trades.length === 0) {
-				await sendMessage(chatId, "No paper trades yet.\n\nAdd wallets to track with /paper add <wallet>");
+				await sendMessage(
+					chatId,
+					"No paper trades yet.\n\nAdd wallets to track with /paper add <wallet>",
+				);
 				return;
 			}
 
 			const lines = trades.map((t) => {
-				const title = t.marketTitle.length > 20
-					? t.marketTitle.slice(0, 20) + "..."
-					: t.marketTitle;
+				const title =
+					t.marketTitle.length > 20
+						? t.marketTitle.slice(0, 20) + "..."
+						: t.marketTitle;
 				const emoji = t.side === "BUY" ? "🟢" : "🔴";
 				const walletShort = t.sourceWallet.slice(0, 6) + "...";
 				return `${emoji} $${t.value.toFixed(0)} ${title}\n   _from ${walletShort}_`;
@@ -1432,7 +1446,10 @@ async function handlePaper(
 		case "golive": {
 			const portfolio = paperService.getPaperPortfolio(user.id);
 			if (!portfolio || portfolio.wallets.length === 0) {
-				await sendMessage(chatId, "No active paper portfolio with tracked wallets.");
+				await sendMessage(
+					chatId,
+					"No active paper portfolio with tracked wallets.",
+				);
 				return;
 			}
 
@@ -1474,7 +1491,10 @@ async function handlePaper(
 		case "wallets": {
 			const wallets = paperService.getTrackedWallets(user.id);
 			if (wallets.length === 0) {
-				await sendMessage(chatId, "No wallets tracked in paper portfolio.\n\nAdd with: /paper add <wallet>");
+				await sendMessage(
+					chatId,
+					"No wallets tracked in paper portfolio.\n\nAdd with: /paper add <wallet>",
+				);
 				return;
 			}
 
