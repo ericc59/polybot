@@ -1478,7 +1478,7 @@ async function handlePaper(
 				return;
 			}
 
-			const lines = wallets.map((w, i) => `${i + 1}. \`${w.slice(0, 10)}...${w.slice(-6)}\``);
+			const lines = wallets.map((w, i) => `${i + 1}. \`${w}\``);
 			await sendMessage(
 				chatId,
 				`*Tracked Wallets (${wallets.length})*\n\n${lines.join("\n")}`,
