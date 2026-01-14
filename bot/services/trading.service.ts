@@ -21,6 +21,7 @@ export interface TradeResult {
   orderId?: string;
   txHash?: string;
   error?: string;
+  fillPrice?: number;  // Approximate fill price
 }
 
 export interface OrderParams {
@@ -38,10 +39,14 @@ export interface MarketOrderParams {
 
 /**
  * Create a CLOB client for a user's trading wallet
+ * @param privateKey - The private key of the signing wallet (EOA)
+ * @param credentials - API credentials
+ * @param proxyAddress - Optional proxy/funder wallet address (for Polymarket proxy wallets)
  */
 export async function createClobClient(
   privateKey: string,
-  credentials: { apiKey: string; apiSecret: string; passphrase: string }
+  credentials: { apiKey: string; apiSecret: string; passphrase: string },
+  proxyAddress?: string
 ): Promise<ClobClient> {
   const provider = new JsonRpcProvider(POLYGON_RPC);
   const wallet = new Wallet(privateKey, provider);
@@ -52,23 +57,83 @@ export async function createClobClient(
     passphrase: credentials.passphrase,
   };
 
-  return new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds);
+  // SignatureType: 0 = EOA, 1 = POLY_GNOSIS_SAFE, 2 = POLY_PROXY
+  // For Polymarket web users with proxy wallets, use POLY_PROXY (2)
+  if (proxyAddress) {
+    const POLY_PROXY = 2;
+    return new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds, POLY_PROXY, proxyAddress);
+  }
+
+  // For direct EOA wallets, use signature type 0
+  return new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds, 0);
 }
 
 /**
  * Get user's USDC balance and allowance
+ * For proxy wallets, fetches USDC balance directly from Polygon
  */
-export async function getBalance(client: ClobClient): Promise<{ balance: number; allowance: number }> {
+export async function getBalance(client: ClobClient, proxyAddress?: string): Promise<{ balance: number; allowance: number }> {
+  // If proxy address provided, fetch USDC balance directly from blockchain
+  if (proxyAddress) {
+    logger.debug(`Fetching balance for proxy wallet: ${proxyAddress}`);
+    try {
+      const balance = await fetchProxyBalance(proxyAddress);
+      logger.debug(`Proxy balance: $${balance.toFixed(2)}`);
+      return { balance, allowance: balance }; // Proxy wallets have pre-approved allowance
+    } catch (error) {
+      logger.error("Failed to get proxy balance", error);
+      // Fall through to try CLOB client
+    }
+  }
+
+  // Standard CLOB client balance check
   try {
     const result = await client.getBalanceAllowance();
+    logger.debug(`CLOB balance: ${result.balance}, allowance: ${result.allowance}`);
     return {
       balance: parseFloat(result.balance || "0"),
       allowance: parseFloat(result.allowance || "0"),
     };
   } catch (error) {
-    logger.error("Failed to get balance", error);
+    logger.error("Failed to get balance from CLOB", error);
     return { balance: 0, allowance: 0 };
   }
+}
+
+/**
+ * Fetch USDC balance for a wallet directly from Polygon blockchain
+ */
+async function fetchProxyBalance(walletAddress: string): Promise<number> {
+  // USDC contract on Polygon
+  const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+  // ERC20 balanceOf function selector + padded address
+  const data = "0x70a08231" + walletAddress.slice(2).toLowerCase().padStart(64, "0");
+
+  const response = await fetch(POLYGON_RPC, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      method: "eth_call",
+      params: [{ to: USDC_ADDRESS, data }, "latest"],
+      id: 1,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`RPC error: ${response.status}`);
+  }
+
+  const result = await response.json() as { result?: string; error?: any };
+
+  if (result.error) {
+    throw new Error(result.error.message || "RPC call failed");
+  }
+
+  // Parse hex result - USDC has 6 decimals
+  const balanceWei = BigInt(result.result || "0x0");
+  return Number(balanceWei) / 1_000_000;
 }
 
 /**
@@ -83,7 +148,11 @@ export async function placeLimitOrder(client: ClobClient, params: OrderParams): 
       price: params.price,
     };
 
-    const result = await client.createAndPostOrder(userOrder, undefined, OrderType.GTC);
+    const result = await client.createAndPostOrder(
+					userOrder,
+					undefined,
+					OrderType.GTC,
+				); // GTC = Good Till Canceled
 
     logger.info(`Order placed: ${JSON.stringify(result)}`);
 
@@ -105,6 +174,15 @@ export async function placeLimitOrder(client: ClobClient, params: OrderParams): 
  */
 export async function placeMarketOrder(client: ClobClient, params: MarketOrderParams): Promise<TradeResult> {
   try {
+    // Get current market price before placing order
+    let fillPrice: number | undefined;
+    try {
+      const priceResult = await client.getPrice(params.tokenId, params.side);
+      fillPrice = parseFloat(priceResult.price || "0");
+    } catch {
+      // Price fetch failed, continue without it
+    }
+
     const userMarketOrder = {
       tokenID: params.tokenId,
       side: params.side === "BUY" ? Side.BUY : Side.SELL,
@@ -119,12 +197,24 @@ export async function placeMarketOrder(client: ClobClient, params: MarketOrderPa
       success: true,
       orderId: result.orderID || result.id,
       txHash: result.transactionHash,
+      fillPrice,
     };
   } catch (error: any) {
+    // Handle specific error cases
+    const errorMsg = error.message || "Unknown error";
+
+    if (errorMsg === "no match" || errorMsg.includes("no match")) {
+      logger.warn(`No liquidity for market order: ${params.tokenId.slice(0, 20)}...`);
+      return {
+        success: false,
+        error: "No liquidity - no sellers available",
+      };
+    }
+
     logger.error("Failed to place market order", error);
     return {
       success: false,
-      error: error.message || "Unknown error",
+      error: errorMsg,
     };
   }
 }
@@ -268,6 +358,7 @@ interface PositionApiResponse {
   curPrice: string;
   title: string;
   outcome: string;
+  endDate?: string;
 }
 
 async function fetchPositionsFromApi(walletAddress: string): Promise<PositionApiResponse[]> {
@@ -320,17 +411,22 @@ export async function getPosition(
 /**
  * Get all user positions
  */
-export async function getAllPositions(client: ClobClient): Promise<Array<{
+export async function getAllPositions(client: ClobClient, proxyAddress?: string): Promise<Array<{
   tokenId: string;
   conditionId?: string;
   size: number;
   avgPrice: number;
+  curPrice: number;
   marketTitle?: string;
   outcome?: string;
+  endDate?: string;
 }>> {
   try {
-    // Get wallet address from client signer
-    const walletAddress = client.signer ? await (client.signer as any).getAddress() : null;
+    // Use proxy address if provided, otherwise get from signer
+    let walletAddress = proxyAddress;
+    if (!walletAddress) {
+      walletAddress = client.signer ? await (client.signer as any).getAddress() : null;
+    }
     if (!walletAddress) {
       return [];
     }
@@ -343,8 +439,10 @@ export async function getAllPositions(client: ClobClient): Promise<Array<{
         conditionId: p.conditionId,
         size: parseFloat(p.size || "0"),
         avgPrice: parseFloat(p.avgPrice || "0"),
+        curPrice: parseFloat(p.curPrice || "0"),
         marketTitle: p.title,
         outcome: p.outcome,
+        endDate: p.endDate,
       }));
   } catch (error) {
     logger.error("Failed to get positions", error);

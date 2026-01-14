@@ -11,7 +11,7 @@ import {
 	discoverProfitableWallets,
 	formatWalletScore,
 } from "../tracker/analyzer";
-import { encryptCredentials } from "../utils/crypto";
+import { encryptCredentials, decryptCredentials } from "../utils/crypto";
 import { logger } from "../utils/logger";
 import {
 	answerCallbackQuery,
@@ -113,6 +113,15 @@ export async function handleCommand(message: TelegramMessage): Promise<void> {
 		case "copyhistory":
 			await handleCopyHistory(user, chatId);
 			break;
+		case "testmode":
+			await handleTestMode(user, chatId);
+			break;
+		case "balance":
+			await handleBalance(user, chatId);
+			break;
+		case "setproxy":
+			await handleSetProxy(user, chatId, args);
+			break;
 		case "subscribe":
 		case "upgrade":
 			await handleSubscribe(user, chatId, args);
@@ -128,6 +137,9 @@ export async function handleCommand(message: TelegramMessage): Promise<void> {
 			break;
 		case "paper":
 			await handlePaper(user, chatId, args);
+			break;
+		case "positions":
+			await handlePositions(user, chatId);
 			break;
 		default:
 			await sendMessage(
@@ -246,6 +258,9 @@ async function handleHelp(chatId: string): Promise<void> {
 *Copy Trading:*
 /connect <private\\_key> - Connect wallet
 /disconnect - Remove trading wallet
+/balance - Check wallet USDC balance
+/positions - View your open positions
+/testmode - Apply ultra-safe test limits
 /copy <wallet> <auto|recommend> - Copy a trader
 /copy off <wallet> - Stop copying
 /limits - View/set trading limits
@@ -258,6 +273,7 @@ async function handleHelp(chatId: string): Promise<void> {
 /paper wallets - List tracked wallets
 /paper status - View portfolio
 /paper history - Trade history
+/paper reset [amount] - Clear positions, reset balance
 /paper stop - Stop and see results
 /paper golive - Switch all to real trading
 
@@ -875,7 +891,18 @@ async function handleConnect(
 		if (saved) {
 			await sendMessage(
 				chatId,
-				`✅ *Wallet Connected*\n\nAddress: \`${address}\`\n\nUse /copy <wallet> auto to enable auto copy-trading.\nUse /limits to set risk controls.`,
+				`✅ *Wallet Connected*\n\n` +
+				`Address: \`${address}\`\n\n` +
+				`*Safe Defaults Applied:*\n` +
+				`• Max ${copyService.SAFE_DEFAULTS.copyPercentage}% of source trade\n` +
+				`• Max $${copyService.SAFE_DEFAULTS.maxTradeSize} per trade\n` +
+				`• $${copyService.SAFE_DEFAULTS.dailyLimit}/day limit\n` +
+				`• Auto-trading: OFF\n\n` +
+				`*Commands:*\n` +
+				`/testmode - Apply ultra-safe test limits\n` +
+				`/limits - View/adjust limits\n` +
+				`/copy <wallet> recommend - Get trade alerts\n` +
+				`/copy <wallet> auto - Enable auto-copy`,
 				{ parseMode: "Markdown" },
 			);
 		} else {
@@ -1053,14 +1080,48 @@ async function handleLimits(
 	const value = args[1];
 
 	switch (setting) {
-		case "enable":
+		case "enable": {
+			// Show confirmation with current limits
+			const copyPct = wallet.copyPercentage;
+			const maxTrade = wallet.maxTradeSize ? `$${wallet.maxTradeSize}` : "No limit ⚠️";
+			const daily = wallet.dailyLimit ? `$${wallet.dailyLimit}` : "No limit ⚠️";
+
+			// Check if limits are dangerously high
+			const warnings: string[] = [];
+			if (!wallet.maxTradeSize || wallet.maxTradeSize > 100) {
+				warnings.push("• Consider setting a max trade size (/limits max 50)");
+			}
+			if (!wallet.dailyLimit || wallet.dailyLimit > 500) {
+				warnings.push("• Consider setting a daily limit (/limits daily 100)");
+			}
+			if (copyPct > 50) {
+				warnings.push("• Copy % is high - consider lowering (/limits copy 10)");
+			}
+
 			copyService.updateTradingSettings(user.id, { copyEnabled: true });
-			await sendMessage(chatId, "Auto copy-trading enabled.");
+
+			const warningText = warnings.length > 0
+				? `\n\n⚠️ *Recommendations:*\n${warnings.join("\n")}`
+				: "";
+
+			await sendMessage(
+				chatId,
+				`✅ *Auto Copy-Trading ENABLED*\n\n` +
+				`Current limits:\n` +
+				`• Copy size: ${copyPct}% of source\n` +
+				`• Max per trade: ${maxTrade}\n` +
+				`• Daily limit: ${daily}\n` +
+				warningText +
+				`\n\n💡 Use /testmode for ultra-safe limits\n` +
+				`Use /limits disable to turn off`,
+				{ parseMode: "Markdown" },
+			);
 			break;
+		}
 
 		case "disable":
 			copyService.updateTradingSettings(user.id, { copyEnabled: false });
-			await sendMessage(chatId, "Auto copy-trading disabled.");
+			await sendMessage(chatId, "🛑 Auto copy-trading disabled.");
 			break;
 
 		case "copy": {
@@ -1139,6 +1200,299 @@ async function handleCopyHistory(
 	await sendMessage(chatId, `*Recent Copy Trades*\n\n${lines.join("\n")}`, {
 		parseMode: "Markdown",
 	});
+}
+
+async function handleTestMode(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+): Promise<void> {
+	const wallet = copyService.getTradingWallet(user.id);
+
+	if (!wallet) {
+		await sendMessage(
+			chatId,
+			"No trading wallet connected. Use /connect first.",
+		);
+		return;
+	}
+
+	// Apply ultra-safe test limits
+	const applied = copyService.applyTestModeLimits(user.id);
+
+	if (applied) {
+		await sendMessage(
+			chatId,
+			`🧪 *Test Mode Activated*\n\n` +
+			`Ultra-safe limits applied:\n` +
+			`• Copy size: ${copyService.TEST_MODE_LIMITS.copyPercentage}% of source trade\n` +
+			`• Max per trade: $${copyService.TEST_MODE_LIMITS.maxTradeSize}\n` +
+			`• Daily limit: $${copyService.TEST_MODE_LIMITS.dailyLimit}\n` +
+			`• Auto-trading: DISABLED\n\n` +
+			`These limits protect you while testing with real money.\n\n` +
+			`To enable auto-trading:\n` +
+			`1. Use /copy <wallet> recommend first (just alerts)\n` +
+			`2. When ready: /limits enable\n\n` +
+			`Use /limits to view or adjust settings.`,
+			{ parseMode: "Markdown" },
+		);
+	} else {
+		await sendMessage(chatId, "Failed to apply test mode. Please try again.");
+	}
+}
+
+async function handleBalance(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+): Promise<void> {
+	const wallet = copyService.getTradingWallet(user.id);
+
+	if (!wallet || !wallet.encryptedCredentials) {
+		await sendMessage(
+			chatId,
+			"No trading wallet connected. Use /connect first.",
+		);
+		return;
+	}
+
+	await sendMessage(chatId, "Checking balance...");
+
+	try {
+		const credentials = decryptCredentials(wallet.encryptedCredentials);
+		const client = await tradingService.createClobClient(
+			(credentials as any).privateKey,
+			{
+				apiKey: credentials.apiKey,
+				apiSecret: credentials.apiSecret,
+				passphrase: credentials.passphrase,
+			},
+			wallet.proxyAddress || undefined  // Pass proxy address if set
+		);
+
+		const { balance, allowance } = await tradingService.getBalance(client, wallet.proxyAddress || undefined);
+
+		const proxyInfo = wallet.proxyAddress
+			? `Proxy: \`${wallet.proxyAddress}\`\n`
+			: "";
+
+		await sendMessage(
+			chatId,
+			`💰 *Wallet Balance*\n\n` +
+			`Signer: \`${wallet.walletAddress}\`\n` +
+			proxyInfo +
+			`\nUSDC Balance: *$${balance.toFixed(2)}*\n` +
+			`Allowance: $${allowance.toFixed(2)}` +
+			(!wallet.proxyAddress ? `\n\n⚠️ No proxy set. If using Polymarket's web interface, use /setproxy <address>` : ""),
+			{ parseMode: "Markdown" },
+		);
+	} catch (error: any) {
+		logger.error("Failed to get balance", error);
+		await sendMessage(chatId, `Failed to check balance: ${error.message}`);
+	}
+}
+
+async function handlePositions(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+): Promise<void> {
+	const wallet = copyService.getTradingWallet(user.id);
+
+	if (!wallet || !wallet.encryptedCredentials) {
+		await sendMessage(
+			chatId,
+			"No trading wallet connected. Use /connect first.",
+		);
+		return;
+	}
+
+	await sendMessage(chatId, "Fetching positions...");
+
+	try {
+		const credentials = decryptCredentials(wallet.encryptedCredentials);
+		const client = await tradingService.createClobClient(
+			(credentials as any).privateKey,
+			{
+				apiKey: credentials.apiKey,
+				apiSecret: credentials.apiSecret,
+				passphrase: credentials.passphrase,
+			},
+			wallet.proxyAddress || undefined
+		);
+
+		const positions = await tradingService.getAllPositions(client, wallet.proxyAddress || undefined);
+
+		if (positions.length === 0) {
+			await sendMessage(
+				chatId,
+				"📊 *Your Positions*\n\nNo open positions.",
+				{ parseMode: "Markdown" },
+			);
+			return;
+		}
+
+		// Calculate totals
+		let totalValue = 0;
+		let totalCost = 0;
+		const lines: string[] = [];
+
+		// Helper to format price in cents
+		const formatPrice = (price: number) => {
+			const cents = price * 100;
+			if (cents < 1) return `${cents.toFixed(1)}¢`;
+			return `${cents.toFixed(0)}¢`;
+		};
+
+		// Helper to format time remaining
+		const formatTimeLeft = (endDate?: string) => {
+			if (!endDate) return "";
+			const end = new Date(endDate + "T23:59:59");
+			const now = new Date();
+			const diff = end.getTime() - now.getTime();
+
+			if (diff <= 0) return "⏰ Ended";
+
+			const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+			const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+
+			if (days > 30) {
+				const months = Math.floor(days / 30);
+				return `⏳ ${months}mo left`;
+			}
+			if (days > 0) return `⏳ ${days}d ${hours}h left`;
+			if (hours > 0) return `⏳ ${hours}h left`;
+			return "⏳ <1h left";
+		};
+
+		for (const pos of positions) {
+			const value = pos.size * pos.curPrice;
+			const cost = pos.size * pos.avgPrice;
+			totalValue += value;
+			totalCost += cost;
+
+			// Potential payout if position wins (each share = $1)
+			const payout = pos.size;
+			const potentialProfit = payout - cost;
+
+			const outcomeEmoji = pos.outcome?.toLowerCase() === "yes" ? "✅" : "❌";
+			const title = pos.marketTitle
+				? pos.marketTitle.length > 30
+					? pos.marketTitle.slice(0, 30) + "..."
+					: pos.marketTitle
+				: "Unknown Market";
+
+			// Format shares/payout - use K for large numbers
+			const formatAmount = (amt: number) => {
+				if (amt >= 1000) return `$${(amt / 1000).toFixed(1)}K`;
+				return `$${amt.toFixed(2)}`;
+			};
+
+			const sharesStr = pos.size >= 1000
+				? `${(pos.size / 1000).toFixed(1)}K`
+				: pos.size.toFixed(1);
+
+			const timeLeft = formatTimeLeft(pos.endDate);
+
+			lines.push(
+				`${outcomeEmoji} *${pos.outcome || "?"}* - ${sharesStr} @ ${formatPrice(pos.curPrice)}\n` +
+				`   ${title}\n` +
+				`   Value: ${formatAmount(value)} → Win: ${formatAmount(payout)} (+${formatAmount(potentialProfit)}) ${timeLeft}`
+			);
+		}
+
+		// Calculate total potential payout
+		const totalPayout = positions.reduce((sum, pos) => sum + pos.size, 0);
+		const totalPotentialProfit = totalPayout - totalCost;
+
+		// Format totals
+		const formatTotal = (amt: number) => {
+			if (amt >= 1000) return `$${(amt / 1000).toFixed(1)}K`;
+			return `$${amt.toFixed(2)}`;
+		};
+
+		await sendMessage(
+			chatId,
+			`📊 *Your Positions* (${positions.length})\n\n` +
+			lines.join("\n\n") +
+			`\n\n💰 Value: *${formatTotal(totalValue)}*\n` +
+			`🎯 If all win: *${formatTotal(totalPayout)}* (+${formatTotal(totalPotentialProfit)})`,
+			{ parseMode: "Markdown" },
+		);
+	} catch (error: any) {
+		logger.error("Failed to get positions", error);
+		await sendMessage(chatId, `Failed to fetch positions: ${error.message}`);
+	}
+}
+
+async function handleSetProxy(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+	args: string[],
+): Promise<void> {
+	const wallet = copyService.getTradingWallet(user.id);
+
+	if (!wallet) {
+		await sendMessage(
+			chatId,
+			"No trading wallet connected. Use /connect first.",
+		);
+		return;
+	}
+
+	const proxyAddress = args[0];
+
+	if (!proxyAddress) {
+		// Show current proxy and instructions
+		if (wallet.proxyAddress) {
+			await sendMessage(
+				chatId,
+				`*Current Proxy Wallet:* \`${wallet.proxyAddress}\`\n\n` +
+				`To change: \`/setproxy <new_address>\`\n` +
+				`To remove: \`/setproxy clear\``,
+				{ parseMode: "Markdown" },
+			);
+		} else {
+			await sendMessage(
+				chatId,
+				`*Set Proxy Wallet*\n\n` +
+				`If you use Polymarket's web interface, your funds are in a proxy wallet.\n\n` +
+				`Find your proxy address:\n` +
+				`1. Go to polymarket.com\n` +
+				`2. Click your profile\n` +
+				`3. Copy the address shown (0x...)\n\n` +
+				`Then: \`/setproxy <address>\``,
+				{ parseMode: "Markdown" },
+			);
+		}
+		return;
+	}
+
+	// Handle clear
+	if (proxyAddress.toLowerCase() === "clear") {
+		copyService.setProxyAddress(user.id, "");
+		await sendMessage(chatId, "Proxy address cleared.");
+		return;
+	}
+
+	// Validate address format
+	if (!/^0x[a-fA-F0-9]{40}$/.test(proxyAddress)) {
+		await sendMessage(chatId, "Invalid address format. Must be 0x followed by 40 hex characters.");
+		return;
+	}
+
+	// Save proxy address
+	const saved = copyService.setProxyAddress(user.id, proxyAddress);
+
+	if (saved) {
+		await sendMessage(
+			chatId,
+			`✅ *Proxy Wallet Set*\n\n` +
+			`Proxy: \`${proxyAddress}\`\n\n` +
+			`The bot will now check balance and trade using this address.\n` +
+			`Run /balance to verify.`,
+			{ parseMode: "Markdown" },
+		);
+	} else {
+		await sendMessage(chatId, "Failed to save proxy address.");
+	}
 }
 
 // =============================================
@@ -1396,6 +1750,24 @@ async function handlePaper(
 				);
 			} else {
 				await sendMessage(chatId, "No active paper portfolio to stop.");
+			}
+			break;
+		}
+
+		case "reset": {
+			const amount = parseFloat(args[1] || "10000");
+			const result = paperService.resetPaperPortfolio(user.id, amount);
+			if (result.success) {
+				await sendMessage(
+					chatId,
+					`*Paper Portfolio Reset*\n\n` +
+					`All positions cleared.\n` +
+					`New balance: $${amount.toFixed(2)}\n\n` +
+					`Your tracked wallets are still active.`,
+					{ parseMode: "Markdown" },
+				);
+			} else {
+				await sendMessage(chatId, `Failed: ${result.error}`);
 			}
 			break;
 		}

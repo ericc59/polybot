@@ -184,3 +184,6 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+
+-- Migration v2: Add proxy wallet support
+ALTER TABLE user_trading_wallets ADD COLUMN proxy_address TEXT;

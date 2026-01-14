@@ -3,6 +3,7 @@ import * as walletRepo from "../db/repositories/wallet.repo";
 import * as alertRepo from "../db/repositories/alert.repo";
 import * as copyService from "./copy.service";
 import * as paperService from "./paper.service";
+import { config } from "../config";
 import { logger } from "../utils/logger";
 import type { Trade } from "../api/polymarket";
 import type { WalletScore } from "../tracker/analyzer";
@@ -168,11 +169,122 @@ function formatAlertMessage(
   return lines.join("\n");
 }
 
+// Copy trade result info for channel message
+interface CopyTradeResult {
+  executed: number;
+  totalCopySize: number;  // Total $ amount of copy trades executed
+  recommended: number;
+  fillPrice?: number;     // Price we got on our copy trade
+}
+
+// Format message for channel broadcast (public-facing, no user-specific data)
+function formatChannelMessage(event: TradeEvent, copyResult?: CopyTradeResult): string {
+  const { trade, walletStats } = event;
+  const tradeSize = parseFloat(trade.size) * parseFloat(trade.price);
+
+  // Determine size indicator
+  let sizeIndicator = "";
+  if (tradeSize >= 50000) sizeIndicator = "🐋🐋🐋";
+  else if (tradeSize >= 10000) sizeIndicator = "🐋🐋";
+  else if (tradeSize >= 5000) sizeIndicator = "🐋";
+  else if (tradeSize >= 1000) sizeIndicator = "💰";
+
+  const sideEmoji = trade.side === "BUY" ? "🟢" : "🔴";
+  const typeEmoji = walletStats?.whaleType ? {
+    active: "🔥",
+    dormant: "💤",
+    sniper: "🎯",
+  }[walletStats.whaleType] || "👀" : "👀";
+
+  const shortAddr = event.walletAddress.slice(0, 6) + "..." + event.walletAddress.slice(-4);
+
+  // Safe access to wallet stats
+  const pnl = walletStats?.totalPnl ?? 0;
+  const winRate = walletStats?.winRate ?? 0;
+
+  const lines = [
+    `${sideEmoji} *${trade.side}* ${sizeIndicator}`,
+    ``,
+    `*${trade.title}*`,
+    `Outcome: ${trade.outcome}`,
+    `Whale: *$${tradeSize.toLocaleString()}* @ ${(parseFloat(trade.price) * 100).toFixed(0)}¢`,
+  ];
+
+  // Add copy trade info if we executed any
+  if (copyResult && copyResult.executed > 0) {
+    const copyPriceStr = copyResult.fillPrice
+      ? ` @ ${(copyResult.fillPrice * 100).toFixed(0)}¢`
+      : "";
+    lines.push(`📋 Copied: *$${copyResult.totalCopySize.toFixed(2)}*${copyPriceStr}`);
+  }
+
+  lines.push(``);
+  lines.push(`${typeEmoji} Trader: \`${shortAddr}\``);
+  lines.push(`PnL: $${pnl.toLocaleString()} | Win: ${(winRate * 100).toFixed(0)}%`);
+
+  if (trade.slug) {
+    lines.push(`\n[View on Polymarket](https://polymarket.com/event/${trade.slug})`);
+  }
+
+  return lines.join("\n");
+}
+
+// Post trade to the public channel/group (if configured)
+async function postToChannel(event: TradeEvent, copyResult?: CopyTradeResult): Promise<boolean> {
+  if (!config.TELEGRAM_CHAT_ID) {
+    return false;
+  }
+
+  try {
+    const message = formatChannelMessage(event, copyResult);
+
+    const keyboard = createInlineKeyboard([
+      [
+        {
+          text: "View Market",
+          url: `https://polymarket.com/event/${event.trade.slug || ""}`,
+        },
+      ],
+    ]);
+
+    await sendMessage(config.TELEGRAM_CHAT_ID, message, {
+      parseMode: "Markdown",
+      replyMarkup: keyboard,
+    });
+
+    logger.debug(`Posted trade to channel: ${event.trade.title?.slice(0, 30)}...`);
+    return true;
+  } catch (error) {
+    logger.error("Failed to post to channel", error);
+    return false;
+  }
+}
+
 // Dispatch alerts to all subscribed users for a trade
 export async function dispatchAlerts(event: TradeEvent): Promise<number> {
   const subscribers = await walletRepo.getWalletSubscribers(event.walletAddress);
   const tradeHash = generateTradeHash(event.trade);
   let sent = 0;
+
+  // Process copy trades FIRST so we know the copy amounts for the channel message
+  let copyResult: CopyTradeResult | undefined;
+  try {
+    const copyStats = await copyService.processCopyTrade(event.walletAddress, event.trade, tradeHash);
+    if (copyStats.recommended > 0 || copyStats.executed > 0) {
+      logger.info(`Copy trading: ${copyStats.recommended} recommended, ${copyStats.executed} executed, ${copyStats.failed} failed`);
+    }
+    copyResult = {
+      executed: copyStats.executed,
+      totalCopySize: copyStats.totalCopySize,
+      recommended: copyStats.recommended,
+      fillPrice: copyStats.fillPrice,
+    };
+  } catch (error) {
+    logger.error("Failed to process copy trades", error);
+  }
+
+  // Post to public channel with copy trade info (if configured)
+  await postToChannel(event, copyResult);
 
   for (const subscriber of subscribers) {
     try {
@@ -253,23 +365,11 @@ export async function dispatchAlerts(event: TradeEvent): Promise<number> {
     logger.info(`Dispatched ${sent} alerts for trade ${tradeHash.slice(0, 16)}...`);
   }
 
-  // Process copy trades for subscribers in auto/recommend mode
-  try {
-    const copyStats = await copyService.processCopyTrade(event.walletAddress, event.trade, tradeHash);
-    if (copyStats.recommended > 0 || copyStats.executed > 0) {
-      logger.info(`Copy trading: ${copyStats.recommended} recommended, ${copyStats.executed} executed, ${copyStats.failed} failed`);
-    }
-  } catch (error) {
-    logger.error("Failed to process copy trades", error);
-  }
-
   // Process paper trades for users simulating this wallet
   try {
     const paperStats = await paperService.processPaperTradesForWallet(event.walletAddress, event.trade);
     if (paperStats.processed > 0 || paperStats.failed > 0) {
       logger.info(`Paper trading: ${paperStats.processed} processed, ${paperStats.failed} failed`);
-    } else {
-      logger.debug(`Paper trading: No active paper portfolios tracking ${event.walletAddress.slice(0, 10)}...`);
     }
   } catch (error) {
     logger.error("Failed to process paper trades", error);

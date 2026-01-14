@@ -4,7 +4,7 @@ import { decryptCredentials } from "../utils/crypto";
 import * as tradingService from "./trading.service";
 import * as consoleUI from "../utils/console-ui";
 import { sendMessage } from "../telegram";
-import type { Trade } from "../api/polymarket";
+import { getMarket, type Trade } from "../api/polymarket";
 
 export type CopyMode = "recommend" | "auto";
 
@@ -23,6 +23,7 @@ export interface TradingWallet {
   copyPercentage: number;
   maxTradeSize: number | null;
   dailyLimit: number | null;
+  proxyAddress: string | null;  // Polymarket proxy wallet address
 }
 
 export interface CopyTradeRecord {
@@ -125,15 +126,30 @@ export function getTradingWallet(userId: number): TradingWallet | null {
       id, user_id as userId, wallet_address as walletAddress,
       encrypted_credentials as encryptedCredentials,
       copy_enabled as copyEnabled, copy_percentage as copyPercentage,
-      max_trade_size as maxTradeSize, daily_limit as dailyLimit
+      max_trade_size as maxTradeSize, daily_limit as dailyLimit,
+      proxy_address as proxyAddress
     FROM user_trading_wallets
     WHERE user_id = ?
   `);
   return stmt.get(userId) as TradingWallet | null;
 }
 
+// Safe default limits for new wallets
+export const SAFE_DEFAULTS = {
+  copyPercentage: 10,      // 10% of source trade size (not 100%)
+  maxTradeSize: 25,        // $25 max per trade
+  dailyLimit: 100,         // $100 daily cap
+};
+
+// Ultra-safe test mode limits
+export const TEST_MODE_LIMITS = {
+  copyPercentage: 5,       // 5% of source trade
+  maxTradeSize: 10,        // $10 max per trade
+  dailyLimit: 50,          // $50 daily cap
+};
+
 /**
- * Save trading wallet for user
+ * Save trading wallet for user with SAFE DEFAULTS
  */
 export function saveTradingWallet(
   userId: number,
@@ -145,7 +161,7 @@ export function saveTradingWallet(
     const existing = getTradingWallet(userId);
 
     if (existing) {
-      // Update existing wallet
+      // Update existing wallet (keep existing limits)
       const stmt = db().prepare(`
         UPDATE user_trading_wallets
         SET wallet_address = ?, encrypted_credentials = ?
@@ -153,18 +169,38 @@ export function saveTradingWallet(
       `);
       stmt.run(walletAddress, encryptedCredentials, userId);
     } else {
-      // Insert new wallet
+      // Insert new wallet with SAFE DEFAULTS
       const stmt = db().prepare(`
-        INSERT INTO user_trading_wallets (user_id, wallet_address, encrypted_credentials)
-        VALUES (?, ?, ?)
+        INSERT INTO user_trading_wallets
+        (user_id, wallet_address, encrypted_credentials, copy_percentage, max_trade_size, daily_limit, copy_enabled)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
       `);
-      stmt.run(userId, walletAddress, encryptedCredentials);
+      stmt.run(
+        userId,
+        walletAddress,
+        encryptedCredentials,
+        SAFE_DEFAULTS.copyPercentage,
+        SAFE_DEFAULTS.maxTradeSize,
+        SAFE_DEFAULTS.dailyLimit
+      );
     }
     return true;
   } catch (error) {
     logger.error("Failed to save trading wallet", error);
     return false;
   }
+}
+
+/**
+ * Apply test mode limits (ultra-safe for testing with real money)
+ */
+export function applyTestModeLimits(userId: number): boolean {
+  return updateTradingSettings(userId, {
+    copyPercentage: TEST_MODE_LIMITS.copyPercentage,
+    maxTradeSize: TEST_MODE_LIMITS.maxTradeSize,
+    dailyLimit: TEST_MODE_LIMITS.dailyLimit,
+    copyEnabled: false, // Start disabled, require explicit enable
+  });
 }
 
 /**
@@ -212,6 +248,24 @@ export function updateTradingSettings(
     return true;
   } catch (error) {
     logger.error("Failed to update trading settings", error);
+    return false;
+  }
+}
+
+/**
+ * Set the proxy wallet address for a user's trading wallet
+ */
+export function setProxyAddress(userId: number, proxyAddress: string): boolean {
+  try {
+    const stmt = db().prepare(`
+      UPDATE user_trading_wallets
+      SET proxy_address = ?
+      WHERE user_id = ?
+    `);
+    stmt.run(proxyAddress, userId);
+    return true;
+  } catch (error) {
+    logger.error("Failed to set proxy address", error);
     return false;
   }
 }
@@ -325,8 +379,13 @@ export async function processCopyTrade(
   sourceWallet: string,
   trade: Trade,
   tradeHash: string
-): Promise<{ recommended: number; executed: number; failed: number }> {
-  const stats = { recommended: 0, executed: 0, failed: 0 };
+): Promise<{ recommended: number; executed: number; failed: number; totalCopySize: number; fillPrice?: number }> {
+  const stats: { recommended: number; executed: number; failed: number; totalCopySize: number; fillPrice?: number } = {
+    recommended: 0,
+    executed: 0,
+    failed: 0,
+    totalCopySize: 0,
+  };
 
   // Get all users subscribed to copy this wallet
   const subscribers = getSubscribersForWallet(sourceWallet);
@@ -348,6 +407,11 @@ export async function processCopyTrade(
         const result = await executeCopyTrade(sub.userId, trade, tradeHash, tradeSize);
         if (result.success) {
           stats.executed++;
+          stats.totalCopySize += result.copySize || 0;
+          // Track the fill price (use last executed price if multiple)
+          if (result.fillPrice !== undefined) {
+            stats.fillPrice = result.fillPrice;
+          }
         } else {
           stats.failed++;
         }
@@ -394,7 +458,7 @@ async function executeCopyTrade(
   trade: Trade,
   tradeHash: string,
   sourceTradeSize: number
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; copySize?: number; fillPrice?: number }> {
   // Get user's trading wallet
   const tradingWallet = getTradingWallet(userId);
 
@@ -417,14 +481,15 @@ async function executeCopyTrade(
         apiKey: credentials.apiKey,
         apiSecret: credentials.apiSecret,
         passphrase: credentials.passphrase,
-      }
+      },
+      tradingWallet.proxyAddress || undefined  // Pass proxy address if set
     );
   } catch (error) {
     return { success: false, error: "Failed to connect to trading API" };
   }
 
   // Get user's current balance for proportional sizing
-  const { balance: userBalance } = await tradingService.getBalance(client);
+  const { balance: userBalance } = await tradingService.getBalance(client, tradingWallet.proxyAddress || undefined);
 
   if (userBalance <= 0) {
     logCopyTrade({
@@ -460,9 +525,14 @@ async function executeCopyTrade(
     copySize = userBalance;
   }
 
-  // Minimum trade size ($1)
+  // Skip if whale's trade is too small (not worth copying)
+  if (sourceTradeSize < 10) {
+    return { success: false, error: "Whale trade too small (min $10)" };
+  }
+
+  // Minimum copy size ($1)
   if (copySize < 1) {
-    return { success: false, error: "Trade size too small (min $1)" };
+    return { success: false, error: "Copy size too small (min $1)" };
   }
 
   logger.debug(`Copy sizing: whale=$${sourceTradeSize.toFixed(0)}, you=$${copySize.toFixed(2)} (balance=$${userBalance.toFixed(0)}, max=${tradingWallet.copyPercentage}%)`)
@@ -491,9 +561,50 @@ async function executeCopyTrade(
   }
 
   try {
+    // Resolve tokenId (asset) - may need to fetch from market API
+    let tokenId = trade.asset;
+    if (!tokenId) {
+      logger.warn(`Missing tokenId (asset) for trade on ${trade.title}, fetching from market API...`);
+      try {
+        const market = await getMarket(trade.conditionId);
+        if (market && market.tokenIds && market.tokenIds.length > 0) {
+          // Use outcomeIndex to get the correct tokenId (0 = Yes, 1 = No typically)
+          const outcomeIndex = trade.outcomeIndex || 0;
+          const fetchedTokenId = market.tokenIds[outcomeIndex];
+          if (fetchedTokenId) {
+            tokenId = fetchedTokenId;
+            logger.info(`Fetched tokenId ${tokenId.slice(0, 20)}... from market API for outcome ${outcomeIndex}`);
+          }
+        }
+      } catch (err) {
+        logger.error(`Failed to fetch market for conditionId ${trade.conditionId}`, err);
+      }
+    }
+
+    if (!tokenId) {
+      logger.error(`Missing tokenId (asset) for trade on ${trade.title}. conditionId: ${trade.conditionId}`);
+      logCopyTrade({
+        userId,
+        sourceWallet: trade.taker || trade.maker,
+        sourceTradeHash: tradeHash,
+        marketConditionId: trade.conditionId,
+        marketTitle: trade.title,
+        side: trade.side,
+        size: copySize,
+        price: parseFloat(trade.price),
+        status: "failed",
+        orderId: null,
+        txHash: null,
+        errorMessage: "Missing tokenId (asset) in trade data",
+      });
+      return { success: false, error: "Missing tokenId (asset) in trade data" };
+    }
+
+    logger.debug(`Copy trade tokenId: ${tokenId.slice(0, 20)}..., conditionId: ${trade.conditionId}`);
+
     // For SELL orders, check our actual position and adjust
     if (trade.side === "SELL") {
-      const position = await tradingService.getPosition(client, trade.asset);
+      const position = await tradingService.getPosition(client, tokenId);
 
       if (!position || position.size <= 0) {
         // Log skipped trade - no position to sell
@@ -535,9 +646,39 @@ async function executeCopyTrade(
       errorMessage: null,
     });
 
-    // Place market order
+    // Check current market price - only execute if we can get whale's price or better
+    const whalePrice = parseFloat(trade.price);
+
+    let currentPrice: number | null = null;
+    try {
+      currentPrice = await tradingService.getMarketPrice(client, tokenId, trade.side);
+    } catch {
+      // Price check failed, skip
+    }
+
+    if (currentPrice === null) {
+      updateCopyTradeStatus(recordId, "skipped", undefined, undefined, "Could not get market price");
+      logger.info(`Skipped copy trade - could not get market price for ${trade.title}`);
+      return { success: false, error: "Could not get market price" };
+    }
+
+    // For BUY: only proceed if current price <= whale's price (same or better)
+    // For SELL: only proceed if current price >= whale's price (same or better)
+    const priceOk = trade.side === "BUY"
+      ? currentPrice <= whalePrice * 1.02  // Allow 2% slippage for BUY
+      : currentPrice >= whalePrice * 0.98; // Allow 2% slippage for SELL
+
+    if (!priceOk) {
+      updateCopyTradeStatus(recordId, "skipped", undefined, undefined, "Price moved");
+      logger.info(`Skipped copy trade - price moved (whale: ${(whalePrice * 100).toFixed(1)}¢, current: ${(currentPrice * 100).toFixed(1)}¢)`);
+      return { success: false, error: "Price moved - skipped" };
+    }
+
+    logger.info(`Placing FOK order: ${trade.side} $${copySize.toFixed(2)} @ ${(currentPrice * 100).toFixed(1)}¢ (whale: ${(whalePrice * 100).toFixed(1)}¢)`);
+
+    // Place FOK market order - fills immediately or fails
     const result = await tradingService.placeMarketOrder(client, {
-      tokenId: trade.asset,
+      tokenId,
       side: trade.side,
       amount: copySize,
     });
@@ -548,19 +689,35 @@ async function executeCopyTrade(
       // Notify user
       const userStmt = db().prepare("SELECT telegram_chat_id FROM users WHERE id = ?");
       const user = userStmt.get(userId) as { telegram_chat_id: string } | null;
+
+      const fillPrice = result.fillPrice ?? currentPrice;
+      const copyDollarValue = trade.side === "SELL"
+        ? copySize * fillPrice
+        : copySize;
+
       if (user) {
         const valueStr = trade.side === "SELL"
           ? `${copySize.toFixed(1)} shares`
           : `$${copySize.toFixed(0)}`;
+        const priceStr = `@ ${(fillPrice * 100).toFixed(1)}¢`;
         await sendMessage(
           user.telegram_chat_id,
-          `✅ *Copy Trade Executed*\n\n${trade.side} ${valueStr} on ${trade.title}`,
+          `✅ *Copy Trade Filled*\n\n${trade.side} ${valueStr} ${priceStr}\n${trade.title}`,
           { parseMode: "Markdown" }
         );
       }
 
-      return { success: true };
+      return { success: true, copySize: copyDollarValue, fillPrice };
     } else {
+      // Check if it's a liquidity issue
+      const isLiquidityIssue = result.error?.includes("No liquidity") || result.error?.includes("no match");
+
+      if (isLiquidityIssue) {
+        updateCopyTradeStatus(recordId, "skipped", undefined, undefined, "No liquidity");
+        logger.info(`Skipped copy trade - no liquidity for ${trade.title}`);
+        return { success: false, error: "No liquidity - skipped" };
+      }
+
       updateCopyTradeStatus(recordId, "failed", undefined, undefined, result.error);
       return { success: false, error: result.error };
     }
@@ -613,13 +770,14 @@ export async function redeemResolvedPositions(): Promise<{
   const users = db().prepare(`
     SELECT
       utw.user_id as userId,
-      utw.encrypted_credentials as encryptedCredentials
+      utw.encrypted_credentials as encryptedCredentials,
+      utw.proxy_address as proxyAddress
     FROM user_trading_wallets utw
     JOIN users u ON utw.user_id = u.id
     WHERE utw.encrypted_credentials IS NOT NULL
       AND u.is_active = 1
       AND u.is_banned = 0
-  `).all() as Array<{ userId: number; encryptedCredentials: string }>;
+  `).all() as Array<{ userId: number; encryptedCredentials: string; proxyAddress: string | null }>;
 
   if (users.length === 0) {
     return { redeemed: 0, totalValue: 0, positions: [] };
@@ -637,7 +795,8 @@ export async function redeemResolvedPositions(): Promise<{
           apiKey: credentials.apiKey,
           apiSecret: credentials.apiSecret,
           passphrase: credentials.passphrase,
-        }
+        },
+        user.proxyAddress || undefined  // Pass proxy address if set
       );
 
       // Get all positions

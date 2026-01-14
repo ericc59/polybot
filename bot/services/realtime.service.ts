@@ -247,13 +247,18 @@ async function handleTradeMessage(
 		return;
 	}
 
+	// Log trade data for debugging
+	if (!trade.assetId) {
+		logger.warn(`Trade missing assetId: ${JSON.stringify({ conditionId: trade.conditionId, title: trade.title })}`);
+	}
+
 	// Convert to Trade format
 	const tradeData: Trade = {
 		id: trade.id,
 		taker: walletAddress,
 		maker: "",
 		side: trade.side,
-		asset: trade.assetId,
+		asset: trade.assetId || "", // May be empty - copy service will validate
 		conditionId: trade.conditionId,
 		size: trade.size,
 		price: trade.price,
@@ -312,7 +317,7 @@ export function getRealtimeStatus(): {
 }
 
 /**
- * Display portfolio stats periodically
+ * Display stats periodically
  */
 let lastPortfolioDisplay = 0;
 function maybeDisplayPortfolioStats(intervalSeconds: number): void {
@@ -322,32 +327,6 @@ function maybeDisplayPortfolioStats(intervalSeconds: number): void {
 	}
 	lastPortfolioDisplay = now;
 
-	// Show trade stats
+	// Show trade stats only (no paper portfolio display)
 	consoleUI.displayStats();
-
-	// Get all active portfolios
-	const portfolios = paperService.getAllActivePortfolios();
-
-	if (portfolios.length > 0) {
-		// Get history for each portfolio
-		const historyMap = new Map<number, paperService.PortfolioSnapshot[]>();
-		for (const p of portfolios) {
-			const history = paperService.getPortfolioHistory(p.portfolioId, 30);
-			if (history.length > 0) {
-				historyMap.set(p.portfolioId, history);
-			}
-		}
-
-		// Get positions for each portfolio
-		const positionsMap = new Map<number, paperService.PaperPosition[]>();
-		for (const p of portfolios) {
-			const positions = paperService.getPortfolioPositions(p.portfolioId);
-			if (positions.length > 0) {
-				positionsMap.set(p.portfolioId, positions);
-			}
-		}
-
-		// Display all portfolios with their graphs and positions
-		consoleUI.displayAllPortfolios(portfolios, historyMap, positionsMap);
-	}
 }

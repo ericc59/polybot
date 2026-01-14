@@ -6,7 +6,8 @@ export const config = {
 
   // Telegram
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || "",
-  // TELEGRAM_CHAT_ID is now per-user in the database
+  // Channel/group for broadcasting all trades (optional)
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || "",
 
   // Server config (for webhook mode)
   PORT: Number(process.env.PORT) || 3000,
