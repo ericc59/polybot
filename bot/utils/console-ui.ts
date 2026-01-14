@@ -177,6 +177,36 @@ export function displayHeader(watchedWallets: number): void {
 }
 
 /**
+ * Display a redemption notification when a market resolves
+ */
+export function displayRedemption(redemption: {
+  title: string;
+  outcome: string;
+  won: boolean;
+  value: number;
+}): void {
+  const timestamp = new Date().toLocaleTimeString();
+  const resultColor = redemption.won ? colors.green : colors.red;
+  const resultText = redemption.won ? "WON" : "LOST";
+  const resultBg = redemption.won ? colors.bgGreen : colors.bgRed;
+  const valueStr = redemption.value > 0 ? `+$${redemption.value.toFixed(2)}` : "$0.00";
+
+  // Truncate title
+  const title = redemption.title.length > 35
+    ? redemption.title.slice(0, 32) + "..."
+    : redemption.title;
+
+  console.log(
+    `${colors.dim}${timestamp}${colors.reset} ` +
+    `${colors.bright}${colors.yellow}🎯 REDEEMED${colors.reset} ` +
+    `${resultBg}${colors.bright}${colors.black} ${resultText} ${colors.reset} ` +
+    `${colors.white}${title}${colors.reset} ` +
+    `${colors.yellow}[${redemption.outcome}]${colors.reset} ` +
+    `${resultColor}${valueStr}${colors.reset}`
+  );
+}
+
+/**
  * Display a paper trade notification with portfolio stats
  */
 export function displayPaperTrade(trade: {
@@ -262,10 +292,12 @@ export function displayPortfolioGraph(
 
   for (let i = 0; i < width && i * step < history.length; i++) {
     const idx = Math.min(i * step, history.length - 1);
-    const val = history[idx].value;
+    const entry = history[idx];
+    if (!entry) continue;
+    const val = entry.value;
     const normalized = (val - minVal) / range;
     const charIdx = Math.floor(normalized * (chars.length - 1));
-    const pnl = history[idx].pnl;
+    const pnl = entry.pnl;
     const charColor = pnl >= 0 ? colors.green : colors.red;
     graphLine += `${charColor}${chars[charIdx]}${colors.reset}`;
   }
@@ -277,9 +309,11 @@ export function displayPortfolioGraph(
   console.log(`${colors.dim}  $${minVal.toFixed(0).padStart(8)}${colors.reset} ┤`);
 
   // Date range
-  if (history.length > 0) {
-    const startDate = new Date(history[0].timestamp * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-    const endDate = new Date(history[history.length - 1].timestamp * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  const firstEntry = history[0];
+  const lastEntry = history[history.length - 1];
+  if (firstEntry && lastEntry) {
+    const startDate = new Date(firstEntry.timestamp * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    const endDate = new Date(lastEntry.timestamp * 1000).toLocaleDateString("en-US", { month: "short", day: "numeric" });
     console.log(`${colors.dim}             ${startDate.padEnd(width / 2)}${endDate.padStart(width / 2)}${colors.reset}`);
   }
 }
@@ -390,8 +424,16 @@ export function displayPosition(pos: {
   hasPriceData: boolean;
   endDate?: number | null;
 }): void {
-  const statusIcon = pos.isWinning ? "✓" : "✗";
-  const statusColor = pos.isWinning ? colors.green : colors.red;
+  // Show unknown status when no price data
+  let statusIcon: string;
+  let statusColor: string;
+  if (!pos.hasPriceData) {
+    statusIcon = "?";
+    statusColor = colors.dim;
+  } else {
+    statusIcon = pos.isWinning ? "✓" : "✗";
+    statusColor = pos.isWinning ? colors.green : colors.red;
+  }
   const pnlSign = pos.pnl >= 0 ? "+" : "";
 
   // Truncate market title
@@ -399,7 +441,6 @@ export function displayPosition(pos: {
     ? pos.marketTitle.slice(0, 32) + "..."
     : pos.marketTitle;
 
-  const priceIndicator = pos.hasPriceData ? "" : `${colors.dim}*${colors.reset}`;
   const countdown = formatCountdown(pos.endDate ?? null);
 
   console.log(
@@ -408,12 +449,23 @@ export function displayPosition(pos: {
     `${colors.yellow}[${pos.outcome}]${colors.reset}` +
     (countdown ? ` ${colors.dim}(${colors.reset}${countdown}${colors.dim})${colors.reset}` : "")
   );
-  console.log(
-    `    ${colors.dim}Entry:${colors.reset} ${(pos.avgPrice * 100).toFixed(0)}¢ → ` +
-    `${colors.dim}Now:${colors.reset} ${(pos.currentPrice * 100).toFixed(0)}¢${priceIndicator}  ` +
-    `${colors.dim}Shares:${colors.reset} ${pos.shares.toFixed(1)}  ` +
-    `${statusColor}${pnlSign}$${pos.pnl.toFixed(2)} (${pnlSign}${pos.pnlPercent.toFixed(1)}%)${colors.reset}`
-  );
+
+  // Show different format when no price data
+  if (!pos.hasPriceData) {
+    console.log(
+      `    ${colors.dim}Entry:${colors.reset} ${(pos.avgPrice * 100).toFixed(0)}¢  ` +
+      `${colors.dim}Shares:${colors.reset} ${pos.shares.toFixed(1)}  ` +
+      `${colors.dim}Value:${colors.reset} $${pos.value.toFixed(2)}  ` +
+      `${colors.dim}(no price data)${colors.reset}`
+    );
+  } else {
+    console.log(
+      `    ${colors.dim}Entry:${colors.reset} ${(pos.avgPrice * 100).toFixed(0)}¢ → ` +
+      `${colors.dim}Now:${colors.reset} ${(pos.currentPrice * 100).toFixed(0)}¢  ` +
+      `${colors.dim}Shares:${colors.reset} ${pos.shares.toFixed(1)}  ` +
+      `${statusColor}${pnlSign}$${pos.pnl.toFixed(2)} (${pnlSign}${pos.pnlPercent.toFixed(1)}%)${colors.reset}`
+    );
+  }
 }
 
 /**
@@ -440,16 +492,22 @@ export function displayPositions(
     return;
   }
 
-  // Sort by P&L (biggest winners first)
-  const sorted = [...positions].sort((a, b) => b.pnl - a.pnl);
+  // Separate positions by price data availability
+  const withPriceData = positions.filter(p => p.hasPriceData);
+  const withoutPriceData = positions.filter(p => !p.hasPriceData);
 
+  // Sort positions with price data by P&L
+  const sorted = [...withPriceData].sort((a, b) => b.pnl - a.pnl);
   const winning = sorted.filter(p => p.isWinning);
   const losing = sorted.filter(p => !p.isWinning);
+
+  // Sort positions without price data by value
+  const unknownSorted = [...withoutPriceData].sort((a, b) => b.value - a.value);
 
   console.log(`\n${colors.cyan}  Open Positions (${positions.length})${colors.reset}`);
   console.log(`${colors.dim}  ───────────────────────────────────────────────────────${colors.reset}`);
 
-  // Show winning positions
+  // Show winning positions (with price data)
   if (winning.length > 0) {
     console.log(`${colors.green}  Winning (${winning.length}):${colors.reset}`);
     for (const pos of winning.slice(0, 5)) {
@@ -460,7 +518,7 @@ export function displayPositions(
     }
   }
 
-  // Show losing positions
+  // Show losing positions (with price data)
   if (losing.length > 0) {
     console.log(`${colors.red}  Losing (${losing.length}):${colors.reset}`);
     for (const pos of losing.slice(0, 5)) {
@@ -471,23 +529,30 @@ export function displayPositions(
     }
   }
 
-  // Summary
-  const totalPnl = positions.reduce((sum, p) => sum + p.pnl, 0);
+  // Show positions without price data
+  if (unknownSorted.length > 0) {
+    console.log(`${colors.dim}  Awaiting Price Data (${unknownSorted.length}):${colors.reset}`);
+    for (const pos of unknownSorted.slice(0, 5)) {
+      displayPosition(pos);
+    }
+    if (unknownSorted.length > 5) {
+      console.log(`${colors.dim}    ...and ${unknownSorted.length - 5} more awaiting data${colors.reset}`);
+    }
+  }
+
+  // Summary - only count P&L for positions with price data
+  const knownPnl = withPriceData.reduce((sum, p) => sum + p.pnl, 0);
   const totalValue = positions.reduce((sum, p) => sum + p.value, 0);
-  const pnlColor = totalPnl >= 0 ? colors.green : colors.red;
-  const pnlSign = totalPnl >= 0 ? "+" : "";
+  const unknownValue = withoutPriceData.reduce((sum, p) => sum + p.value, 0);
+  const pnlColor = knownPnl >= 0 ? colors.green : colors.red;
+  const pnlSign = knownPnl >= 0 ? "+" : "";
 
   console.log(`${colors.dim}  ───────────────────────────────────────────────────────${colors.reset}`);
   console.log(
-    `  ${colors.dim}Total Position Value:${colors.reset} ${colors.white}$${totalValue.toFixed(2)}${colors.reset}  ` +
-    `${colors.dim}Unrealized P&L:${colors.reset} ${pnlColor}${pnlSign}$${totalPnl.toFixed(2)}${colors.reset}`
+    `  ${colors.dim}Total Value:${colors.reset} ${colors.white}$${totalValue.toFixed(2)}${colors.reset}  ` +
+    `${colors.dim}Unrealized P&L:${colors.reset} ${pnlColor}${pnlSign}$${knownPnl.toFixed(2)}${colors.reset}` +
+    (withoutPriceData.length > 0 ? `  ${colors.dim}($${unknownValue.toFixed(0)} awaiting prices)${colors.reset}` : "")
   );
-
-  // Price data note
-  const staleCount = positions.filter(p => !p.hasPriceData).length;
-  if (staleCount > 0) {
-    console.log(`${colors.dim}  * = No recent price data (using entry price)${colors.reset}`);
-  }
 }
 
 /**

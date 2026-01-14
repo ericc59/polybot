@@ -4,6 +4,13 @@ import * as consoleUI from "../utils/console-ui";
 import * as priceService from "./price.service";
 import { getMarket, type Trade } from "../api/polymarket";
 
+// Extended market info for resolution checking
+interface MarketResolution {
+  resolved: boolean;
+  winningOutcome: string | null;
+  outcomes: Array<{ outcome: string; winner: boolean }>;
+}
+
 export interface PaperPortfolio {
   id: number;
   userId: number;
@@ -297,6 +304,101 @@ export function stopPaperTrading(userId: number): { success: boolean; portfolio?
   }
 
   return { success: true, portfolio: portfolio || undefined };
+}
+
+/**
+ * Completely delete a paper portfolio and all related data
+ */
+export function deletePaperPortfolio(userId: number): boolean {
+  try {
+    // Get portfolio ID first
+    const portfolio = db().prepare(`
+      SELECT id FROM paper_portfolios WHERE user_id = ?
+    `).get(userId) as { id: number } | null;
+
+    if (!portfolio) {
+      return true; // Nothing to delete
+    }
+
+    // Delete related data
+    db().prepare(`DELETE FROM paper_trades WHERE portfolio_id = ?`).run(portfolio.id);
+    db().prepare(`DELETE FROM paper_positions WHERE portfolio_id = ?`).run(portfolio.id);
+    db().prepare(`DELETE FROM paper_portfolio_wallets WHERE portfolio_id = ?`).run(portfolio.id);
+    db().prepare(`DELETE FROM paper_snapshots WHERE portfolio_id = ?`).run(portfolio.id);
+
+    // Delete portfolio
+    db().prepare(`DELETE FROM paper_portfolios WHERE id = ?`).run(portfolio.id);
+
+    logger.info(`Deleted paper portfolio for user ${userId}`);
+    return true;
+  } catch (error) {
+    logger.error("Failed to delete paper portfolio", error);
+    return false;
+  }
+}
+
+/**
+ * Reset paper portfolio - clear positions and reset balance
+ * Keeps tracked wallets and trade history
+ */
+export function resetPaperPortfolio(userId: number, newBalance: number): { success: boolean; error?: string } {
+  try {
+    const portfolio = db().prepare(`
+      SELECT id FROM paper_portfolios WHERE user_id = ?
+    `).get(userId) as { id: number } | null;
+
+    if (!portfolio) {
+      return { success: false, error: "No paper portfolio found" };
+    }
+
+    // Clear all positions
+    db().prepare(`DELETE FROM paper_positions WHERE portfolio_id = ?`).run(portfolio.id);
+
+    // Reset balance
+    db().prepare(`
+      UPDATE paper_portfolios
+      SET starting_balance = ?, current_cash = ?, is_active = 1
+      WHERE id = ?
+    `).run(newBalance, newBalance, portfolio.id);
+
+    logger.info(`Reset paper portfolio for user ${userId} to $${newBalance}`);
+    return { success: true };
+  } catch (error: any) {
+    logger.error("Failed to reset paper portfolio", error);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Add funds to paper portfolio
+ */
+export function topUpPaperPortfolio(userId: number, amount: number): { success: boolean; newBalance?: number; error?: string } {
+  if (amount <= 0) {
+    return { success: false, error: "Amount must be positive" };
+  }
+
+  const portfolio = db().prepare(`
+    SELECT id, current_cash, starting_balance
+    FROM paper_portfolios
+    WHERE user_id = ? AND is_active = 1
+  `).get(userId) as { id: number; current_cash: number; starting_balance: number } | null;
+
+  if (!portfolio) {
+    return { success: false, error: "No active paper portfolio" };
+  }
+
+  const newCash = portfolio.current_cash + amount;
+  const newStarting = portfolio.starting_balance + amount;
+
+  db().prepare(`
+    UPDATE paper_portfolios
+    SET current_cash = ?, starting_balance = ?
+    WHERE id = ?
+  `).run(newCash, newStarting, portfolio.id);
+
+  logger.info(`Added $${amount} to paper portfolio for user ${userId}. New balance: $${newCash.toFixed(2)}`);
+
+  return { success: true, newBalance: newCash };
 }
 
 /**
@@ -879,4 +981,332 @@ export function getAllActivePortfolios(): Array<{
       startedAt: p.startedAt,
     };
   });
+}
+
+/**
+ * Backfill end dates for positions that don't have them
+ */
+export async function backfillEndDates(): Promise<{ updated: number; failed: number }> {
+  initPaperTables();
+
+  // Find positions without end dates
+  const positions = db().prepare(`
+    SELECT id, condition_id FROM paper_positions
+    WHERE end_date IS NULL AND shares > 0
+  `).all() as Array<{ id: number; condition_id: string }>;
+
+  if (positions.length === 0) {
+    return { updated: 0, failed: 0 };
+  }
+
+  logger.info(`Backfilling end dates for ${positions.length} positions...`);
+
+  let updated = 0;
+  let failed = 0;
+
+  // Group by condition_id to avoid duplicate API calls
+  const conditionIds = [...new Set(positions.map(p => p.condition_id))];
+
+  for (const conditionId of conditionIds) {
+    try {
+      const market = await getMarket(conditionId);
+      if (market?.endDate) {
+        const endDate = Math.floor(new Date(market.endDate).getTime() / 1000);
+
+        // Update all positions with this condition_id
+        const result = db().prepare(`
+          UPDATE paper_positions SET end_date = ?
+          WHERE condition_id = ? AND end_date IS NULL
+        `).run(endDate, conditionId);
+
+        updated += result.changes;
+        logger.debug(`Updated end date for condition ${conditionId}: ${market.endDate}`);
+      } else {
+        failed++;
+      }
+    } catch (error) {
+      failed++;
+      logger.debug(`Failed to fetch market for ${conditionId}`);
+    }
+
+    // Small delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  logger.info(`Backfill complete: ${updated} updated, ${failed} failed`);
+  return { updated, failed };
+}
+
+/**
+ * Refresh prices for positions that don't have recent price data
+ */
+export async function refreshStalePositionPrices(): Promise<{ updated: number; failed: number }> {
+  initPaperTables();
+
+  // Get all positions
+  const positions = db().prepare(`
+    SELECT DISTINCT condition_id, asset_id, outcome, market_title
+    FROM paper_positions
+    WHERE shares > 0
+  `).all() as Array<{
+    condition_id: string;
+    asset_id: string | null;
+    outcome: string;
+    market_title: string;
+  }>;
+
+  if (positions.length === 0) {
+    return { updated: 0, failed: 0 };
+  }
+
+  // Filter to only positions without recent price data
+  const stalePositions = positions.filter((pos) => {
+    const priceKey = pos.asset_id || pos.condition_id;
+    return priceService.getPrice(priceKey) === null;
+  });
+
+  if (stalePositions.length === 0) {
+    logger.debug("No stale positions need price refresh");
+    return { updated: 0, failed: 0 };
+  }
+
+  logger.info(`Refreshing prices for ${stalePositions.length} stale positions...`);
+
+  return priceService.fetchPricesForPositions(
+    stalePositions.map((pos) => ({
+      conditionId: pos.condition_id,
+      assetId: pos.asset_id || undefined,
+      outcome: pos.outcome,
+      title: pos.market_title,
+    }))
+  );
+}
+
+/**
+ * Check if a market is resolved and get the winning outcome
+ */
+async function getMarketResolution(conditionId: string): Promise<MarketResolution | null> {
+  try {
+    const url = `https://clob.polymarket.com/markets/${conditionId}`;
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const data = await response.json() as {
+      condition_id: string;
+      tokens: Array<{ outcome: string; winner: boolean }>;
+      closed?: boolean;
+      archived?: boolean;
+    };
+
+    // Check if market is resolved (archived means fully resolved)
+    const isResolved = data.archived === true;
+
+    if (!isResolved) {
+      return { resolved: false, winningOutcome: null, outcomes: data.tokens || [] };
+    }
+
+    // Find the winning outcome
+    const winner = data.tokens?.find(t => t.winner === true);
+
+    return {
+      resolved: true,
+      winningOutcome: winner?.outcome || null,
+      outcomes: data.tokens || [],
+    };
+  } catch (error) {
+    logger.debug(`Failed to check resolution for ${conditionId}`);
+    return null;
+  }
+}
+
+/**
+ * Redeem resolved positions at their final value
+ * Winners get $1 per share, losers get $0
+ */
+export async function redeemResolvedPositions(): Promise<{
+  redeemed: number;
+  totalValue: number;
+  positions: Array<{ title: string; outcome: string; won: boolean; value: number }>;
+}> {
+  initPaperTables();
+
+  // Get all open positions with end dates in the past
+  const now = Math.floor(Date.now() / 1000);
+  const positions = db().prepare(`
+    SELECT
+      pp.id,
+      pp.portfolio_id,
+      pp.condition_id,
+      pp.asset_id,
+      pp.market_title,
+      pp.outcome,
+      pp.shares,
+      pp.avg_price
+    FROM paper_positions pp
+    WHERE pp.shares > 0 AND pp.end_date IS NOT NULL AND pp.end_date < ?
+  `).all(now) as Array<{
+    id: number;
+    portfolio_id: number;
+    condition_id: string;
+    asset_id: string | null;
+    market_title: string;
+    outcome: string;
+    shares: number;
+    avg_price: number;
+  }>;
+
+  if (positions.length === 0) {
+    return { redeemed: 0, totalValue: 0, positions: [] };
+  }
+
+  logger.info(`Checking ${positions.length} ended positions for redemption...`);
+
+  let redeemed = 0;
+  let totalValue = 0;
+  const redeemedPositions: Array<{ title: string; outcome: string; won: boolean; value: number }> = [];
+
+  // Group by condition_id to minimize API calls
+  const byCondition = new Map<string, typeof positions>();
+  for (const pos of positions) {
+    const existing = byCondition.get(pos.condition_id) || [];
+    existing.push(pos);
+    byCondition.set(pos.condition_id, existing);
+  }
+
+  for (const [conditionId, conditionPositions] of byCondition) {
+    const resolution = await getMarketResolution(conditionId);
+
+    if (!resolution || !resolution.resolved) {
+      // Market not resolved yet, skip
+      continue;
+    }
+
+    for (const pos of conditionPositions) {
+      // Determine if this position won
+      const won = pos.outcome.toLowerCase() === resolution.winningOutcome?.toLowerCase();
+      const redemptionPrice = won ? 1.0 : 0.0;
+      const redemptionValue = pos.shares * redemptionPrice;
+
+      // Add cash to portfolio
+      db().prepare(`
+        UPDATE paper_portfolios SET current_cash = current_cash + ?
+        WHERE id = ?
+      `).run(redemptionValue, pos.portfolio_id);
+
+      // Record the redemption as a trade
+      db().prepare(`
+        INSERT INTO paper_trades (portfolio_id, source_wallet, condition_id, market_title, outcome, side, shares, price, value)
+        VALUES (?, 'REDEMPTION', ?, ?, ?, 'REDEEM', ?, ?, ?)
+      `).run(
+        pos.portfolio_id,
+        pos.condition_id,
+        pos.market_title,
+        pos.outcome,
+        pos.shares,
+        redemptionPrice,
+        redemptionValue
+      );
+
+      // Delete the position
+      db().prepare(`DELETE FROM paper_positions WHERE id = ?`).run(pos.id);
+
+      // Take a snapshot
+      takePortfolioSnapshot(pos.portfolio_id);
+
+      redeemed++;
+      totalValue += redemptionValue;
+      redeemedPositions.push({
+        title: pos.market_title || "Unknown",
+        outcome: pos.outcome,
+        won,
+        value: redemptionValue,
+      });
+
+      const wonText = won ? "WON" : "LOST";
+      const valueText = redemptionValue > 0 ? `+$${redemptionValue.toFixed(2)}` : "$0.00";
+      logger.info(`Redeemed: ${pos.market_title?.slice(0, 40)}... [${pos.outcome}] - ${wonText} ${valueText}`);
+    }
+
+    // Small delay to avoid rate limiting
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  if (redeemed > 0) {
+    logger.success(`Redeemed ${redeemed} resolved positions for $${totalValue.toFixed(2)}`);
+  }
+
+  return { redeemed, totalValue, positions: redeemedPositions };
+}
+
+/**
+ * Initialize paper trading and backfill missing data
+ * Call this on startup to ensure data is up to date
+ */
+export async function initAndBackfill(): Promise<void> {
+  initPaperTables();
+
+  // Backfill end dates for positions missing them
+  const endDateResult = await backfillEndDates();
+  if (endDateResult.updated > 0) {
+    logger.info(`Backfilled ${endDateResult.updated} position end dates`);
+  }
+
+  // Refresh prices for stale positions
+  const priceResult = await refreshStalePositionPrices();
+  if (priceResult.updated > 0) {
+    logger.info(`Refreshed ${priceResult.updated} position prices`);
+  }
+
+  // Redeem any resolved positions
+  const redeemResult = await redeemResolvedPositions();
+  if (redeemResult.redeemed > 0) {
+    logger.success(`Auto-redeemed ${redeemResult.redeemed} positions for $${redeemResult.totalValue.toFixed(2)}`);
+  }
+}
+
+// Interval handle for redemption monitor
+let redemptionInterval: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Start periodic redemption checking (every 5 minutes)
+ */
+export function startRedemptionMonitor(intervalMs: number = 5 * 60 * 1000): void {
+  if (redemptionInterval) {
+    return; // Already running
+  }
+
+  logger.info(`Starting redemption monitor (checking every ${intervalMs / 1000}s)`);
+
+  redemptionInterval = setInterval(async () => {
+    try {
+      const result = await redeemResolvedPositions();
+      if (result.redeemed > 0) {
+        // Display redemptions in console
+        for (const pos of result.positions) {
+          consoleUI.displayRedemption({
+            title: pos.title,
+            outcome: pos.outcome,
+            won: pos.won,
+            value: pos.value,
+          });
+        }
+      }
+    } catch (error) {
+      logger.error("Redemption check failed", error);
+    }
+  }, intervalMs);
+}
+
+/**
+ * Stop redemption monitor
+ */
+export function stopRedemptionMonitor(): void {
+  if (redemptionInterval) {
+    clearInterval(redemptionInterval);
+    redemptionInterval = null;
+    logger.info("Redemption monitor stopped");
+  }
 }

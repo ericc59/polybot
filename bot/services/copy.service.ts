@@ -2,6 +2,7 @@ import { db } from "../db/index";
 import { logger } from "../utils/logger";
 import { decryptCredentials } from "../utils/crypto";
 import * as tradingService from "./trading.service";
+import * as consoleUI from "../utils/console-ui";
 import { sendMessage } from "../telegram";
 import type { Trade } from "../api/polymarket";
 
@@ -140,14 +141,25 @@ export function saveTradingWallet(
   encryptedCredentials: string
 ): boolean {
   try {
-    const stmt = db().prepare(`
-      INSERT INTO user_trading_wallets (user_id, wallet_address, encrypted_credentials)
-      VALUES (?, ?, ?)
-      ON CONFLICT(user_id) DO UPDATE SET
-        wallet_address = ?,
-        encrypted_credentials = ?
-    `);
-    stmt.run(userId, walletAddress, encryptedCredentials, walletAddress, encryptedCredentials);
+    // Check if user already has a trading wallet
+    const existing = getTradingWallet(userId);
+
+    if (existing) {
+      // Update existing wallet
+      const stmt = db().prepare(`
+        UPDATE user_trading_wallets
+        SET wallet_address = ?, encrypted_credentials = ?
+        WHERE user_id = ?
+      `);
+      stmt.run(walletAddress, encryptedCredentials, userId);
+    } else {
+      // Insert new wallet
+      const stmt = db().prepare(`
+        INSERT INTO user_trading_wallets (user_id, wallet_address, encrypted_credentials)
+        VALUES (?, ?, ?)
+      `);
+      stmt.run(userId, walletAddress, encryptedCredentials);
+    }
     return true;
   } catch (error) {
     logger.error("Failed to save trading wallet", error);
@@ -295,7 +307,7 @@ export function getCopyTradeHistory(userId: number, limit = 20): CopyTradeRecord
       created_at as createdAt, executed_at as executedAt
     FROM copy_trade_history
     WHERE user_id = ?
-    ORDER BY created_at DESC
+    ORDER BY id DESC
     LIMIT ?
   `);
   return stmt.all(userId, limit) as CopyTradeRecord[];
@@ -394,13 +406,66 @@ async function executeCopyTrade(
     return { success: false, error: "Copy trading disabled" };
   }
 
-  // Calculate copy trade size
-  let copySize = sourceTradeSize * (tradingWallet.copyPercentage / 100);
+  // Decrypt credentials and create client first (need for balance check)
+  const credentials = decryptCredentials(tradingWallet.encryptedCredentials);
+
+  let client;
+  try {
+    client = await tradingService.createClobClient(
+      (credentials as any).privateKey,
+      {
+        apiKey: credentials.apiKey,
+        apiSecret: credentials.apiSecret,
+        passphrase: credentials.passphrase,
+      }
+    );
+  } catch (error) {
+    return { success: false, error: "Failed to connect to trading API" };
+  }
+
+  // Get user's current balance for proportional sizing
+  const { balance: userBalance } = await tradingService.getBalance(client);
+
+  if (userBalance <= 0) {
+    logCopyTrade({
+      userId,
+      sourceWallet: trade.taker || trade.maker,
+      sourceTradeHash: tradeHash,
+      marketConditionId: trade.conditionId,
+      marketTitle: trade.title,
+      side: trade.side,
+      size: 0,
+      price: parseFloat(trade.price),
+      status: "skipped",
+      orderId: null,
+      txHash: null,
+      errorMessage: "Insufficient balance",
+    });
+    return { success: false, error: "Insufficient balance" };
+  }
+
+  // Smart copy sizing:
+  // - If whale trade is small (affordable), copy 1:1
+  // - If whale trade is large, cap at % of your balance
+  const maxAffordable = userBalance * (tradingWallet.copyPercentage / 100);
+  let copySize = Math.min(sourceTradeSize, maxAffordable);
 
   // Apply max trade size limit
   if (tradingWallet.maxTradeSize && copySize > tradingWallet.maxTradeSize) {
     copySize = tradingWallet.maxTradeSize;
   }
+
+  // Also cap at user's available balance
+  if (copySize > userBalance) {
+    copySize = userBalance;
+  }
+
+  // Minimum trade size ($1)
+  if (copySize < 1) {
+    return { success: false, error: "Trade size too small (min $1)" };
+  }
+
+  logger.debug(`Copy sizing: whale=$${sourceTradeSize.toFixed(0)}, you=$${copySize.toFixed(2)} (balance=$${userBalance.toFixed(0)}, max=${tradingWallet.copyPercentage}%)`)
 
   // Check daily limit
   if (tradingWallet.dailyLimit) {
@@ -425,24 +490,7 @@ async function executeCopyTrade(
     }
   }
 
-  // Decrypt credentials and create client
-  const credentials = decryptCredentials(tradingWallet.encryptedCredentials);
-
-  // Note: We need the private key which should be stored encrypted
-  // For now, we'll assume it's part of the credentials
-  // In production, use a more secure key management system
-
   try {
-    // Create CLOB client
-    const client = await tradingService.createClobClient(
-      (credentials as any).privateKey,
-      {
-        apiKey: credentials.apiKey,
-        apiSecret: credentials.apiSecret,
-        passphrase: credentials.passphrase,
-      }
-    );
-
     // For SELL orders, check our actual position and adjust
     if (trade.side === "SELL") {
       const position = await tradingService.getPosition(client, trade.asset);
@@ -543,4 +591,191 @@ export function generateCopyLink(trade: Trade): string {
   // Polymarket doesn't have a true deep link for trades
   // Best we can do is link to the market page
   return `https://polymarket.com/event/${trade.slug}`;
+}
+
+// =============================================
+// AUTO-REDEMPTION FOR REAL COPY TRADING
+// =============================================
+
+/**
+ * Redeem resolved positions for all users with connected trading wallets
+ */
+export async function redeemResolvedPositions(): Promise<{
+  redeemed: number;
+  totalValue: number;
+  positions: Array<{ userId: number; title: string; outcome: string; won: boolean; value: number }>;
+}> {
+  let redeemed = 0;
+  let totalValue = 0;
+  const redeemedPositions: Array<{ userId: number; title: string; outcome: string; won: boolean; value: number }> = [];
+
+  // Get all users with connected trading wallets
+  const users = db().prepare(`
+    SELECT
+      utw.user_id as userId,
+      utw.encrypted_credentials as encryptedCredentials
+    FROM user_trading_wallets utw
+    JOIN users u ON utw.user_id = u.id
+    WHERE utw.encrypted_credentials IS NOT NULL
+      AND u.is_active = 1
+      AND u.is_banned = 0
+  `).all() as Array<{ userId: number; encryptedCredentials: string }>;
+
+  if (users.length === 0) {
+    return { redeemed: 0, totalValue: 0, positions: [] };
+  }
+
+  logger.info(`Checking positions for ${users.length} users with connected wallets...`);
+
+  for (const user of users) {
+    try {
+      // Decrypt credentials and create client
+      const credentials = decryptCredentials(user.encryptedCredentials);
+      const client = await tradingService.createClobClient(
+        (credentials as any).privateKey,
+        {
+          apiKey: credentials.apiKey,
+          apiSecret: credentials.apiSecret,
+          passphrase: credentials.passphrase,
+        }
+      );
+
+      // Get all positions
+      const positions = await tradingService.getAllPositions(client);
+
+      if (positions.length === 0) {
+        continue;
+      }
+
+      // Check each position for resolution
+      for (const pos of positions) {
+        if (!pos.conditionId) continue;
+
+        const resolution = await tradingService.getMarketResolution(pos.conditionId);
+
+        if (!resolution || !resolution.resolved) {
+          continue;
+        }
+
+        // Determine if this position won
+        const won = pos.outcome?.toLowerCase() === resolution.winningOutcome?.toLowerCase();
+        const redemptionValue = won ? pos.size : 0; // $1 per share for winners, $0 for losers
+
+        // Redeem the position
+        const result = await tradingService.redeemPosition(client, pos.tokenId, pos.size, won);
+
+        if (result.success) {
+          redeemed++;
+          totalValue += redemptionValue;
+          redeemedPositions.push({
+            userId: user.userId,
+            title: pos.marketTitle || "Unknown",
+            outcome: pos.outcome || "",
+            won,
+            value: redemptionValue,
+          });
+
+          // Log the redemption
+          logCopyTrade({
+            userId: user.userId,
+            sourceWallet: "REDEMPTION",
+            sourceTradeHash: `REDEEM_${pos.tokenId}_${Date.now()}`,
+            marketConditionId: pos.conditionId,
+            marketTitle: pos.marketTitle || "",
+            side: "REDEEM",
+            size: pos.size,
+            price: won ? 1.0 : 0,
+            status: "executed",
+            orderId: result.orderId || null,
+            txHash: result.txHash || null,
+            errorMessage: null,
+          });
+
+          // Notify user
+          const userStmt = db().prepare("SELECT telegram_chat_id FROM users WHERE id = ?");
+          const userRecord = userStmt.get(user.userId) as { telegram_chat_id: string } | null;
+          if (userRecord) {
+            const wonText = won ? "🎉 WON" : "❌ LOST";
+            const valueText = won ? `+$${redemptionValue.toFixed(2)}` : "$0.00";
+            await sendMessage(
+              userRecord.telegram_chat_id,
+              `🎯 *Position Redeemed*\n\n${wonText}\n*Market:* ${pos.marketTitle}\n*Outcome:* ${pos.outcome}\n*Value:* ${valueText}`,
+              { parseMode: "Markdown" }
+            );
+          }
+
+          const wonLog = won ? "WON" : "LOST";
+          const valueLog = redemptionValue > 0 ? `+$${redemptionValue.toFixed(2)}` : "$0.00";
+          logger.info(`User ${user.userId} redeemed: ${pos.marketTitle?.slice(0, 40)}... [${pos.outcome}] - ${wonLog} ${valueLog}`);
+        }
+
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    } catch (error) {
+      logger.error(`Failed to check redemptions for user ${user.userId}`, error);
+    }
+  }
+
+  if (redeemed > 0) {
+    logger.success(`Real trading: Redeemed ${redeemed} positions for $${totalValue.toFixed(2)}`);
+  }
+
+  return { redeemed, totalValue, positions: redeemedPositions };
+}
+
+// Interval handle for real trading redemption monitor
+let realRedemptionInterval: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Start periodic redemption checking for real copy trading (every 5 minutes)
+ */
+export function startRealRedemptionMonitor(intervalMs: number = 5 * 60 * 1000): void {
+  if (realRedemptionInterval) {
+    return; // Already running
+  }
+
+  logger.info(`Starting real trading redemption monitor (checking every ${intervalMs / 1000}s)`);
+
+  realRedemptionInterval = setInterval(async () => {
+    try {
+      const result = await redeemResolvedPositions();
+      if (result.redeemed > 0) {
+        // Display redemptions in console
+        for (const pos of result.positions) {
+          consoleUI.displayRedemption({
+            title: pos.title,
+            outcome: pos.outcome,
+            won: pos.won,
+            value: pos.value,
+          });
+        }
+      }
+    } catch (error) {
+      logger.error("Real trading redemption check failed", error);
+    }
+  }, intervalMs);
+}
+
+/**
+ * Stop real trading redemption monitor
+ */
+export function stopRealRedemptionMonitor(): void {
+  if (realRedemptionInterval) {
+    clearInterval(realRedemptionInterval);
+    realRedemptionInterval = null;
+    logger.info("Real trading redemption monitor stopped");
+  }
+}
+
+/**
+ * Initialize real copy trading and check for redemptions
+ * Call this on startup
+ */
+export async function initAndCheckRedemptions(): Promise<void> {
+  // Check for any resolved positions that need redemption
+  const result = await redeemResolvedPositions();
+  if (result.redeemed > 0) {
+    logger.success(`Real trading startup: Redeemed ${result.redeemed} positions for $${result.totalValue.toFixed(2)}`);
+  }
 }

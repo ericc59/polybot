@@ -186,6 +186,7 @@ export interface Market {
   description: string;
   outcomes: string[];
   outcomePrices: string[];
+  tokenIds?: string[];  // Asset IDs for each outcome
   volume: string;
   liquidity: string;
   endDate: string;
@@ -196,17 +197,57 @@ export interface Market {
   category?: string;
 }
 
-// Fetch market details from Gamma API
+// CLOB market response
+interface ClobMarket {
+  condition_id: string;
+  question: string;
+  description?: string;
+  end_date_iso?: string;
+  game_start_time?: string;
+  tokens: Array<{
+    token_id: string;
+    outcome: string;
+    price: number;
+    winner: boolean;
+  }>;
+  closed?: boolean;
+  archived?: boolean;
+}
+
+// Fetch market details from CLOB API (more reliable for prices)
 export async function getMarket(conditionId: string): Promise<Market | null> {
   try {
-    const url = new URL(`/markets/${conditionId}`, config.GAMMA_API);
-    const response = await fetch(url.toString());
+    // Use CLOB API which accepts conditionId directly
+    const url = `https://clob.polymarket.com/markets/${conditionId}`;
+    const response = await fetch(url);
 
     if (!response.ok) {
       return null;
     }
 
-    return (await response.json()) as Market;
+    const data = (await response.json()) as ClobMarket;
+
+    // Transform CLOB response to Market format
+    const outcomes = data.tokens?.map((t) => t.outcome) || [];
+    const outcomePrices = data.tokens?.map((t) => String(t.price)) || [];
+    const tokenIds = data.tokens?.map((t) => t.token_id) || [];
+
+    return {
+      id: data.condition_id,
+      conditionId: data.condition_id,
+      slug: "",
+      title: data.question || "",
+      description: data.description || "",
+      outcomes,
+      outcomePrices,
+      tokenIds,
+      volume: "0",
+      liquidity: "0",
+      endDate: data.end_date_iso || data.game_start_time || "",
+      createdAt: "",
+      closed: data.closed || false,
+      resolved: data.archived || false,
+    };
   } catch (error) {
     return null;
   }

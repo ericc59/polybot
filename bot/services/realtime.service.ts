@@ -182,17 +182,23 @@ async function handleTradeMessage(
 	// Check if this wallet is being watched
 	const isMatched = watchedWallets.has(walletAddress);
 
-	// Display trade in console (matched or not for stats)
-	const tradeSize = parseFloat(trade.size) * parseFloat(trade.price);
-	consoleUI.displayTrade({
-		side: trade.side,
-		wallet: walletAddress,
-		market: trade.title || trade.marketSlug || "Unknown Market",
-		outcome: trade.outcome,
-		size: tradeSize,
-		price: parseFloat(trade.price),
-		isMatched,
-	});
+	// Generate trade hash for dedup (check BEFORE display/logging)
+	const tradeHash = `${trade.transactionHash}-${trade.id}`;
+	const isDuplicate = recentlyProcessed.has(tradeHash);
+
+	// Display trade in console (but not duplicates for matched wallets)
+	if (!isDuplicate || !isMatched) {
+		const tradeSize = parseFloat(trade.size) * parseFloat(trade.price);
+		consoleUI.displayTrade({
+			side: trade.side,
+			wallet: walletAddress,
+			market: trade.title || trade.marketSlug || "Unknown Market",
+			outcome: trade.outcome,
+			size: tradeSize,
+			price: parseFloat(trade.price),
+			isMatched,
+		});
+	}
 
 	// Show stats periodically (every 60 seconds)
 	maybeDisplayPortfolioStats(60);
@@ -201,15 +207,8 @@ async function handleTradeMessage(
 		return;
 	}
 
-	tradesMatched++;
-	logger.info(
-		`Real-time trade detected from watched wallet ${walletAddress.slice(0, 10)}...`,
-	);
-
-	// Generate trade hash for dedup
-	const tradeHash = `${trade.transactionHash}-${trade.id}`;
-
-	if (recentlyProcessed.has(tradeHash)) {
+	// Skip duplicate matched trades
+	if (isDuplicate) {
 		return;
 	}
 	recentlyProcessed.add(tradeHash);
@@ -224,6 +223,11 @@ async function handleTradeMessage(
 			recentlyProcessed.delete(next.value);
 		}
 	}
+
+	tradesMatched++;
+	logger.info(
+		`Real-time trade detected from watched wallet ${walletAddress.slice(0, 10)}...`,
+	);
 
 	// Get wallet stats from cache or analyze
 	let walletStats = await walletRepo.getWalletFromCache(walletAddress);
