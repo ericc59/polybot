@@ -283,8 +283,10 @@ export async function dispatchAlerts(event: TradeEvent): Promise<number> {
     logger.error("Failed to process copy trades", error);
   }
 
-  // Post to public channel with copy trade info (if configured)
-  await postToChannel(event, copyResult);
+  // Only post to channel if a copy trade was executed
+  if (copyResult && copyResult.executed > 0) {
+    await postToChannel(event, copyResult);
+  }
 
   for (const subscriber of subscribers) {
     try {

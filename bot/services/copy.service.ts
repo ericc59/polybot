@@ -136,9 +136,9 @@ export function getTradingWallet(userId: number): TradingWallet | null {
 
 // Safe default limits for new wallets
 export const SAFE_DEFAULTS = {
-  copyPercentage: 10,      // 10% of source trade size (not 100%)
-  maxTradeSize: 25,        // $25 max per trade
-  dailyLimit: 100,         // $100 daily cap
+	copyPercentage: 10, // 10% of source trade size (not 100%)
+	maxTradeSize: 10, // $10 max per trade
+	dailyLimit: 100, // $100 daily cap
 };
 
 // Ultra-safe test mode limits
@@ -339,10 +339,12 @@ export function updateCopyTradeStatus(
  */
 export function getTodaysCopyTotal(userId: number): number {
   const startOfDay = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
-  const stmt = db().prepare(`
-    SELECT COALESCE(SUM(size * price), 0) as total
+  // Only count BUY orders for daily limit (money going out)
+		// For BUY: size is the dollar amount spent
+		const stmt = db().prepare(`
+    SELECT COALESCE(SUM(size), 0) as total
     FROM copy_trade_history
-    WHERE user_id = ? AND status = 'executed' AND created_at >= ?
+    WHERE user_id = ? AND status = 'executed' AND side = 'BUY' AND created_at >= ?
   `);
   const result = stmt.get(userId, startOfDay) as { total: number };
   return result.total;
@@ -510,24 +512,28 @@ async function executeCopyTrade(
   }
 
   // Smart copy sizing:
-  // - If whale trade is small (affordable), copy 1:1
-  // - If whale trade is large, cap at % of your balance
-  const maxAffordable = userBalance * (tradingWallet.copyPercentage / 100);
-  let copySize = Math.min(sourceTradeSize, maxAffordable);
+		// - If whale trade is under max trade size, match it exactly (1:1)
+		// - If whale trade exceeds max trade size, cap at max trade size
+		// - Fallback to % of balance if no max trade size is set
+		let copySize: number;
 
-  // Apply max trade size limit
-  if (tradingWallet.maxTradeSize && copySize > tradingWallet.maxTradeSize) {
-    copySize = tradingWallet.maxTradeSize;
-  }
+  if (tradingWallet.maxTradeSize) {
+			if (sourceTradeSize <= tradingWallet.maxTradeSize) {
+				// Match the whale's bet exactly
+				copySize = sourceTradeSize;
+			} else {
+				// Whale bet exceeds our max, use our max
+				copySize = tradingWallet.maxTradeSize;
+			}
+		} else {
+			// No max trade size set - use percentage-based sizing
+			const maxAffordable = userBalance * (tradingWallet.copyPercentage / 100);
+			copySize = Math.min(sourceTradeSize, maxAffordable);
+		}
 
   // Also cap at user's available balance
   if (copySize > userBalance) {
     copySize = userBalance;
-  }
-
-  // Skip if whale's trade is too small (not worth copying)
-  if (sourceTradeSize < 10) {
-    return { success: false, error: "Whale trade too small (min $10)" };
   }
 
   // Minimum copy size ($1)
@@ -535,7 +541,9 @@ async function executeCopyTrade(
     return { success: false, error: "Copy size too small (min $1)" };
   }
 
-  logger.debug(`Copy sizing: whale=$${sourceTradeSize.toFixed(0)}, you=$${copySize.toFixed(2)} (balance=$${userBalance.toFixed(0)}, max=${tradingWallet.copyPercentage}%)`)
+  logger.debug(
+			`Copy sizing: whale=$${sourceTradeSize.toFixed(0)}, you=$${copySize.toFixed(2)} (balance=$${userBalance.toFixed(0)}, maxTradeSize=$${tradingWallet.maxTradeSize || "none"})`,
+		);
 
   // Check daily limit
   if (tradingWallet.dailyLimit) {
