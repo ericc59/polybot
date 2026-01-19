@@ -49,4 +49,29 @@ export const logger = {
       `${colors.debug}[POLL]${colors.reset} Tracking ${tracked} wallets | ${newTrades} new trades`
     );
   },
+
+  edge: (outcome: string, edge: number, minEdge: number) => {
+    const edgePct = (edge * 100).toFixed(2);
+    const isValue = edge >= minEdge;
+    const isPositive = edge > 0;
+
+    let color: string;
+    let symbol: string;
+
+    if (isValue) {
+      color = colors.success; // green for value bets
+      symbol = "✓";
+    } else if (isPositive) {
+      color = colors.warn; // yellow for positive but below threshold
+      symbol = "○";
+    } else {
+      color = colors.error; // red for negative edge
+      symbol = "✗";
+    }
+
+    const sign = edge >= 0 ? "+" : "";
+    console.log(
+      `${colors.debug}[${timestamp()}]${colors.reset} ${symbol} ${outcome}: ${color}${sign}${edgePct}%${colors.reset}`
+    );
+  },
 };

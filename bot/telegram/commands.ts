@@ -6,6 +6,7 @@ import * as copyService from "../services/copy.service";
 import * as paperService from "../services/paper.service";
 import * as stripeService from "../services/stripe.service";
 import * as tradingService from "../services/trading.service";
+import * as sportsService from "../services/sports.service";
 import {
 	analyzeWallet,
 	discoverProfitableWallets,
@@ -113,6 +114,9 @@ export async function handleCommand(message: TelegramMessage): Promise<void> {
 		case "copyhistory":
 			await handleCopyHistory(user, chatId);
 			break;
+		case "volumedebug":
+			await handleVolumeDebug(user, chatId);
+			break;
 		case "testmode":
 			await handleTestMode(user, chatId);
 			break;
@@ -140,6 +144,24 @@ export async function handleCommand(message: TelegramMessage): Promise<void> {
 			break;
 		case "positions":
 			await handlePositions(user, chatId);
+			break;
+		case "redeem":
+			await handleRedeem(user, chatId);
+			break;
+		case "ignore":
+			await handleIgnore(user, chatId, args);
+			break;
+		case "unignore":
+			await handleUnignore(user, chatId, args);
+			break;
+		case "ignored":
+			await handleIgnored(user, chatId);
+			break;
+		case "resetvolume":
+			await handleResetVolume(user, chatId);
+			break;
+		case "sports":
+			await handleSports(user, chatId, args);
 			break;
 		default:
 			await sendMessage(
@@ -260,11 +282,15 @@ async function handleHelp(chatId: string): Promise<void> {
 /disconnect - Remove trading wallet
 /balance - Check wallet USDC balance
 /positions - View your open positions
+/redeem - Redeem winning positions (at 100%)
 /testmode - Apply ultra-safe test limits
 /copy <wallet> <auto|recommend> - Copy a trader
 /copy off <wallet> - Stop copying
 /limits - View/set trading limits
 /copyhistory - Recent copy trades
+/ignore <pattern> - Ignore markets matching pattern
+/unignore <pattern> - Remove from ignore list
+/ignored - View ignored patterns
 
 *Paper Trading:*
 /paper start [amount] - Start with virtual $amount
@@ -276,6 +302,17 @@ async function handleHelp(chatId: string): Promise<void> {
 /paper reset [amount] - Clear positions, reset balance
 /paper stop - Stop and see results
 /paper golive - Switch all to real trading
+
+*Sports Betting:*
+/sports - Sports value betting help
+/sports status - View settings & current stats
+/sports enable <sport> - Enable (nba, nfl, etc.)
+/sports disable <sport> - Disable a sport
+/sports auto <on|off> - Toggle auto-betting
+/sports edge <percent> - Set min edge
+/sports maxbet <amount> - Set max bet
+/sports value - Show current value bets
+/sports history - Recent sports bets
 
 *Subscription:*
 /plan - View current plan & pricing
@@ -1055,6 +1092,7 @@ async function handleLimits(
 			? `$${wallet.maxTradeSize}`
 			: "No limit";
 		const dailyLimit = wallet.dailyLimit ? `$${wallet.dailyLimit}` : "No limit";
+		const maxPerMarket = wallet.maxPerMarket ? `$${wallet.maxPerMarket}` : "No limit";
 		const todaysTotal = copyService.getTodaysCopyTotal(user.id);
 		const copyEnabled = wallet.copyEnabled ? "ENABLED" : "DISABLED";
 
@@ -1064,12 +1102,14 @@ async function handleLimits(
 				`Status: *${copyEnabled}*\n` +
 				`Copy Size: ${copyPct}% of source trade\n` +
 				`Max Trade: ${maxTrade}\n` +
+				`Max Per Market: ${maxPerMarket}\n` +
 				`Daily Limit: ${dailyLimit}\n` +
 				`Today's Volume: $${todaysTotal.toFixed(0)}\n\n` +
 				`*Commands:*\n` +
 				`/limits enable|disable\n` +
 				`/limits copy <percent>\n` +
 				`/limits max <amount>\n` +
+				`/limits market <amount>\n` +
 				`/limits daily <amount>`,
 			{ parseMode: "Markdown" },
 		);
@@ -1084,12 +1124,16 @@ async function handleLimits(
 			// Show confirmation with current limits
 			const copyPct = wallet.copyPercentage;
 			const maxTrade = wallet.maxTradeSize ? `$${wallet.maxTradeSize}` : "No limit ⚠️";
+			const maxMarket = wallet.maxPerMarket ? `$${wallet.maxPerMarket}` : "No limit ⚠️";
 			const daily = wallet.dailyLimit ? `$${wallet.dailyLimit}` : "No limit ⚠️";
 
 			// Check if limits are dangerously high
 			const warnings: string[] = [];
 			if (!wallet.maxTradeSize || wallet.maxTradeSize > 100) {
 				warnings.push("• Consider setting a max trade size (/limits max 50)");
+			}
+			if (!wallet.maxPerMarket || wallet.maxPerMarket > 100) {
+				warnings.push("• Consider setting a max per market (/limits market 25)");
 			}
 			if (!wallet.dailyLimit || wallet.dailyLimit > 500) {
 				warnings.push("• Consider setting a daily limit (/limits daily 100)");
@@ -1110,6 +1154,7 @@ async function handleLimits(
 				`Current limits:\n` +
 				`• Copy size: ${copyPct}% of source\n` +
 				`• Max per trade: ${maxTrade}\n` +
+				`• Max per market: ${maxMarket}\n` +
 				`• Daily limit: ${daily}\n` +
 				warningText +
 				`\n\n💡 Use /testmode for ultra-safe limits\n` +
@@ -1167,10 +1212,28 @@ async function handleLimits(
 			break;
 		}
 
+		case "market": {
+			const market = parseFloat(value || "0");
+			if (isNaN(market) || market < 0) {
+				await sendMessage(chatId, "Invalid amount.");
+				return;
+			}
+			copyService.updateTradingSettings(user.id, {
+				maxPerMarket: market > 0 ? market : null,
+			});
+			await sendMessage(
+				chatId,
+				market > 0
+					? `Max per market set to $${market}. You won't exceed this on any single event.`
+					: "Max per market limit removed.",
+			);
+			break;
+		}
+
 		default:
 			await sendMessage(
 				chatId,
-				"Unknown setting. Use enable, disable, copy, max, or daily.",
+				"Unknown setting. Use enable, disable, copy, max, market, or daily.",
 			);
 	}
 }
@@ -1202,6 +1265,46 @@ async function handleCopyHistory(
 	});
 }
 
+async function handleVolumeDebug(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+): Promise<void> {
+	const breakdown = copyService.getTodaysCopyBreakdown(user.id);
+
+	if (breakdown.trades.length === 0) {
+		await sendMessage(chatId, "No trades today.");
+		return;
+	}
+
+	const executedTrades = breakdown.trades.filter(
+		(t) => t.status === "executed",
+	);
+	const confirmedTrades = executedTrades.filter((t) => t.hasTxHash);
+	const unconfirmedTrades = executedTrades.filter((t) => !t.hasTxHash);
+
+	// Group confirmed by size
+	const sizeGroups: Record<string, number> = {};
+	for (const t of confirmedTrades) {
+		const key = `$${t.size.toFixed(0)}`;
+		sizeGroups[key] = (sizeGroups[key] || 0) + 1;
+	}
+	const groupLines = Object.entries(sizeGroups)
+		.sort((a, b) => b[1] - a[1])
+		.slice(0, 10)
+		.map(([size, count]) => `${size} × ${count}`);
+
+	const msg =
+		`*Volume Debug*\n\n` +
+		`Executed: ${executedTrades.length}\n` +
+		`Confirmed (w/ txHash): ${confirmedTrades.length}\n` +
+		`Unconfirmed: ${unconfirmedTrades.length}\n\n` +
+		`*Old total: $${breakdown.total.toFixed(2)}*\n` +
+		`*New total (confirmed): $${breakdown.totalWithTxHash.toFixed(2)}*\n\n` +
+		`Confirmed by amount:\n${groupLines.join("\n")}`;
+
+	await sendMessage(chatId, msg, { parseMode: "Markdown" });
+}
+
 async function handleTestMode(
 	user: userRepo.UserWithSettings,
 	chatId: string,
@@ -1226,6 +1329,7 @@ async function handleTestMode(
 			`Ultra-safe limits applied:\n` +
 			`• Copy size: ${copyService.TEST_MODE_LIMITS.copyPercentage}% of source trade\n` +
 			`• Max per trade: $${copyService.TEST_MODE_LIMITS.maxTradeSize}\n` +
+			`• Max per market: $${copyService.TEST_MODE_LIMITS.maxPerMarket}\n` +
 			`• Daily limit: $${copyService.TEST_MODE_LIMITS.dailyLimit}\n` +
 			`• Auto-trading: DISABLED\n\n` +
 			`These limits protect you while testing with real money.\n\n` +
@@ -1422,6 +1526,88 @@ async function handlePositions(
 	}
 }
 
+async function handleRedeem(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+): Promise<void> {
+	const wallet = copyService.getTradingWallet(user.id);
+
+	if (!wallet || !wallet.encryptedCredentials) {
+		await sendMessage(
+			chatId,
+			"No trading wallet connected. Use /connect first.",
+		);
+		return;
+	}
+
+	await sendMessage(chatId, "🔍 Checking for redeemable positions...");
+
+	try {
+		const credentials = decryptCredentials(wallet.encryptedCredentials);
+		const client = await tradingService.createClobClient(
+			(credentials as any).privateKey,
+			{
+				apiKey: credentials.apiKey,
+				apiSecret: credentials.apiSecret,
+				passphrase: credentials.passphrase,
+			},
+			wallet.proxyAddress || undefined
+		);
+
+		const positions = await tradingService.getAllPositions(client, wallet.proxyAddress || undefined);
+
+		// Find positions at 100% (winners ready to redeem)
+		const redeemable = positions.filter(pos => pos.curPrice >= 0.99);
+
+		if (redeemable.length === 0) {
+			await sendMessage(
+				chatId,
+				"📊 *No Redeemable Positions*\n\nNo positions at 100% to redeem. Positions need to be fully resolved (price = $1.00) before redemption.",
+				{ parseMode: "Markdown" },
+			);
+			return;
+		}
+
+		await sendMessage(
+			chatId,
+			`Found ${redeemable.length} redeemable position(s). Redeeming...`,
+		);
+
+		let redeemed = 0;
+		let totalValue = 0;
+		const results: string[] = [];
+
+		for (const pos of redeemable) {
+			const result = await tradingService.redeemPosition(
+				client,
+				pos.tokenId,
+				pos.size,
+				true // isWinner
+			);
+
+			if (result.success) {
+				redeemed++;
+				totalValue += pos.size;
+				results.push(`✅ ${pos.outcome} - ${pos.size.toFixed(2)} shares → $${pos.size.toFixed(2)}`);
+			} else {
+				results.push(`❌ ${pos.outcome} - Failed: ${result.error}`);
+			}
+		}
+
+		await sendMessage(
+			chatId,
+			`💰 *Redemption Complete*\n\n` +
+			`Redeemed: ${redeemed}/${redeemable.length}\n` +
+			`Value: $${totalValue.toFixed(2)}\n\n` +
+			results.join("\n"),
+			{ parseMode: "Markdown" },
+		);
+	} catch (error: any) {
+		logger.error("Failed to redeem positions", error);
+		await sendMessage(chatId, `Failed to redeem: ${error.message}`);
+	}
+}
+
 async function handleSetProxy(
 	user: userRepo.UserWithSettings,
 	chatId: string,
@@ -1492,6 +1678,584 @@ async function handleSetProxy(
 		);
 	} else {
 		await sendMessage(chatId, "Failed to save proxy address.");
+	}
+}
+
+// =============================================
+// IGNORED MARKETS COMMANDS
+// =============================================
+
+async function handleIgnore(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+	args: string[],
+): Promise<void> {
+	const pattern = args.join(" ").trim();
+
+	if (!pattern) {
+		await sendMessage(
+			chatId,
+			"*Ignore Markets*\n\n" +
+			"Prevent copy trading on specific markets by pattern.\n\n" +
+			"Usage: `/ignore <pattern>`\n\n" +
+			"Examples:\n" +
+			"• `/ignore NBA Finals`\n" +
+			"• `/ignore Super Bowl`\n" +
+			"• `/ignore Bitcoin`\n\n" +
+			"The pattern matches any part of the market title (case-insensitive).",
+			{ parseMode: "Markdown" },
+		);
+		return;
+	}
+
+	const added = copyService.addIgnoredMarket(user.id, pattern);
+
+	if (added) {
+		await sendMessage(
+			chatId,
+			`✅ Added "\`${pattern}\`" to your ignore list.\n\nCopy trades matching this pattern will be skipped.`,
+			{ parseMode: "Markdown" },
+		);
+	} else {
+		await sendMessage(chatId, "Failed to add pattern. Please try again.");
+	}
+}
+
+async function handleUnignore(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+	args: string[],
+): Promise<void> {
+	const pattern = args.join(" ").trim();
+
+	if (!pattern) {
+		await sendMessage(
+			chatId,
+			"Usage: `/unignore <pattern>`\n\nRemoves a pattern from your ignore list.",
+			{ parseMode: "Markdown" },
+		);
+		return;
+	}
+
+	const removed = copyService.removeIgnoredMarket(user.id, pattern);
+
+	if (removed) {
+		await sendMessage(
+			chatId,
+			`✅ Removed "\`${pattern}\`" from your ignore list.`,
+			{ parseMode: "Markdown" },
+		);
+	} else {
+		await sendMessage(chatId, "Failed to remove pattern. It may not exist in your list.");
+	}
+}
+
+async function handleIgnored(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+): Promise<void> {
+	const patterns = copyService.getIgnoredMarkets(user.id);
+
+	if (patterns.length === 0) {
+		await sendMessage(
+			chatId,
+			"*Ignored Markets*\n\n" +
+			"No patterns in your ignore list.\n\n" +
+			"Use `/ignore <pattern>` to add one.",
+			{ parseMode: "Markdown" },
+		);
+		return;
+	}
+
+	const lines = patterns.map((p, i) => `${i + 1}. \`${p}\``);
+
+	await sendMessage(
+		chatId,
+		`*Ignored Markets (${patterns.length})*\n\n` +
+		`${lines.join("\n")}\n\n` +
+		`Use \`/unignore <pattern>\` to remove.`,
+		{ parseMode: "Markdown" },
+	);
+}
+
+async function handleResetVolume(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+): Promise<void> {
+	const beforeVolume = copyService.getTodaysCopyTotal(user.id);
+	copyService.resetTodaysVolume(user.id);
+
+	await sendMessage(
+		chatId,
+		`✅ *Volume Reset*\n\n` +
+		`Previous: $${beforeVolume.toFixed(0)}\n` +
+		`Current: $0\n\n` +
+		`Your daily limit counter has been reset.`,
+		{ parseMode: "Markdown" },
+	);
+}
+
+// =============================================
+// SPORTS BETTING COMMANDS
+// =============================================
+
+async function handleSports(
+	user: userRepo.UserWithSettings,
+	chatId: string,
+	args: string[],
+): Promise<void> {
+	const subcommand = args[0]?.toLowerCase();
+
+	switch (subcommand) {
+		case "status": {
+			const status = sportsService.getStatus(user.id);
+			const config = status.config;
+
+			// Get current exposure
+			const currentExposure = sportsService.getTotalOpenExposure(user.id);
+
+			// Get balance for exposure limit calculation
+			let balance = 0;
+			try {
+				const wallet = copyService.getTradingWallet(user.id);
+				if (wallet?.encryptedCredentials) {
+					const credentials = decryptCredentials(wallet.encryptedCredentials);
+					const client = await tradingService.createClobClient(
+						(credentials as any).privateKey,
+						{
+							apiKey: credentials.apiKey,
+							apiSecret: credentials.apiSecret,
+							passphrase: credentials.passphrase,
+						},
+						wallet.proxyAddress || undefined
+					);
+					const balanceResult = await tradingService.getBalance(client, wallet.proxyAddress || undefined);
+					balance = balanceResult.balance;
+				}
+			} catch {
+				// Ignore balance errors
+			}
+
+			const maxExposure = balance * config.maxExposurePct;
+			const exposureAvailable = Math.max(0, maxExposure - currentExposure);
+
+			// Clean up sport names
+			const enabledSports = config.sports
+				.map(s => s
+					.replace("basketball_", "")
+					.replace("americanfootball_", "")
+					.replace("icehockey_", "")
+					.replace("baseball_", "")
+					.replace("soccer_", "")
+					.replace("tennis_", "")
+					.replace(/_/g, " ")
+					.toUpperCase()
+				)
+				.join(", ") || "None";
+
+			await sendMessage(
+				chatId,
+				`🏀 *Sports Betting Status*\n\n` +
+				`*Monitoring:* ${status.monitoring ? "✅ Running" : "⏸ Stopped"}\n` +
+				`*Auto-trade:* ${config.autoTrade ? "ON" : "OFF"}\n\n` +
+				`*Exposure:*\n` +
+				`• Current: $${currentExposure.toFixed(0)} / $${maxExposure.toFixed(0)} (${(config.maxExposurePct * 100).toFixed(0)}% of bankroll)\n` +
+				`• Available: $${exposureAvailable.toFixed(0)}\n\n` +
+				`*Buy Settings:*\n` +
+				`• Min edge to buy: ${(config.minEdge * 100).toFixed(1)}%\n` +
+				`• Bet size: $${config.minBetUsd} - $${config.maxBetUsd}\n` +
+				`• Max per market: $${config.maxPerMarket}\n` +
+				`• Books required: ${config.booksRequired}+\n\n` +
+				`*Sell Settings:*\n` +
+				`• Min sell edge: ${(config.minSellEdge * 100).toFixed(0)}%\n` +
+				`• Max hold price: ${(config.maxHoldPrice * 100).toFixed(0)}¢\n\n` +
+				`*Sports:* ${enabledSports}\n\n` +
+				`*Activity:*\n` +
+				`• Today's volume: $${status.todaysVolume.toFixed(0)}\n` +
+				`• Value bets found: ${status.valueBetsFound}\n` +
+				`• Last poll: ${status.lastPoll ? new Date(status.lastPoll).toLocaleTimeString() : "Never"}`,
+				{ parseMode: "Markdown" },
+			);
+			break;
+		}
+
+		case "enable": {
+			const sport = args[1]?.toLowerCase();
+			if (!sport) {
+				await sendMessage(
+					chatId,
+					"Usage: /sports enable <sport>\n\nSports: nba, ncaab, nfl, mlb, nhl, soccer, tennis",
+				);
+				return;
+			}
+
+			const sportMap: Record<string, string> = {
+				nba: "basketball_nba",
+				ncaab: "basketball_ncaab",
+				ncaa: "basketball_ncaab",
+				cbb: "basketball_ncaab",
+				nfl: "americanfootball_nfl",
+				mlb: "baseball_mlb",
+				nhl: "icehockey_nhl",
+				soccer: "soccer_epl",
+				tennis: "tennis_atp_aus_open",
+			};
+
+			const sportKey = sportMap[sport];
+			if (!sportKey) {
+				await sendMessage(chatId, `Unknown sport: ${sport}`);
+				return;
+			}
+
+			const config = sportsService.getSportsConfig(user.id);
+			if (!config.sports.includes(sportKey)) {
+				config.sports.push(sportKey);
+				sportsService.updateSportsConfig(user.id, { sports: config.sports });
+			}
+
+			await sendMessage(chatId, `✅ Enabled ${sport.toUpperCase()} for value betting`);
+			break;
+		}
+
+		case "disable": {
+			const sport = args[1]?.toLowerCase();
+			if (!sport) {
+				await sendMessage(chatId, "Usage: /sports disable <sport>");
+				return;
+			}
+
+			const sportMap: Record<string, string> = {
+				nba: "basketball_nba",
+				ncaab: "basketball_ncaab",
+				ncaa: "basketball_ncaab",
+				cbb: "basketball_ncaab",
+				nfl: "americanfootball_nfl",
+				mlb: "baseball_mlb",
+				nhl: "icehockey_nhl",
+				soccer: "soccer_epl",
+				tennis: "tennis_atp_aus_open",
+			};
+
+			const sportKey = sportMap[sport];
+			if (!sportKey) {
+				await sendMessage(chatId, `Unknown sport: ${sport}`);
+				return;
+			}
+
+			const config = sportsService.getSportsConfig(user.id);
+			config.sports = config.sports.filter((s) => s !== sportKey);
+			sportsService.updateSportsConfig(user.id, { sports: config.sports });
+
+			await sendMessage(chatId, `🛑 Disabled ${sport.toUpperCase()}`);
+			break;
+		}
+
+		case "start": {
+			const config = sportsService.getSportsConfig(user.id);
+			if (!config.autoTrade) {
+				await sendMessage(chatId, "⚠️ Auto-trade is OFF. Use `/sports auto on` first, or monitoring will only find bets without placing them.");
+			}
+			sportsService.startMonitoring(user.id);
+			await sendMessage(
+				chatId,
+				`🚀 *Sports betting monitor started!*\n\n` +
+				`Polling every 15 seconds for value bets.\n` +
+				`Sports: ${config.sports.map(s => s.replace("basketball_", "").replace("americanfootball_", "").toUpperCase()).join(", ")}\n` +
+				`Min edge: ${(config.minEdge * 100).toFixed(0)}%\n` +
+				`Max bet: $${config.maxBetUsd}`,
+				{ parseMode: "Markdown" },
+			);
+			break;
+		}
+
+		case "stop": {
+			sportsService.stopMonitoring();
+			await sendMessage(chatId, "🛑 Sports betting monitor stopped");
+			break;
+		}
+
+		case "markets": {
+			// Show what Polymarket sports markets actually exist for configured sports
+			const config = sportsService.getSportsConfig(user.id);
+			const polyEvents = await sportsService.fetchPolymarketSportsEvents(config.sports);
+
+			if (polyEvents.length === 0) {
+				await sendMessage(chatId, "No Polymarket sports events found for your configured sports.");
+				return;
+			}
+
+			const lines = polyEvents.slice(0, 15).map((e: any) => `• ${e.title}`);
+			await sendMessage(
+				chatId,
+				`📊 *Polymarket Sports Events (${polyEvents.length} total)*\n\n${lines.join("\n")}\n\n${polyEvents.length > 15 ? `...and ${polyEvents.length - 15} more` : ""}`,
+				{ parseMode: "Markdown" },
+			);
+			break;
+		}
+
+		case "scan": {
+			await sendMessage(chatId, "🔍 Scanning for value bets (check server logs for debug info)...");
+			const config = sportsService.getSportsConfig(user.id);
+
+			// Fetch Polymarket events FIRST (source of truth)
+			const polyEvents = await sportsService.fetchPolymarketSportsEvents(config.sports);
+
+			// Fetch odds from Odds API
+			const odds = await sportsService.fetchAllConfiguredOdds(config);
+
+			// Pass debug=true to log all comparisons to server console
+			const valueBets = await sportsService.findValueBets(odds, polyEvents, config, true);
+
+			if (valueBets.length === 0) {
+				await sendMessage(
+					chatId,
+					`No value bets found.\n\n` +
+					`Scanned ${odds.length} matches, ${polyEvents.length} Polymarket events.\n` +
+					`Min edge: ${(config.minEdge * 100).toFixed(0)}%\n\n` +
+					`Check server logs for detailed comparison data.`,
+				);
+			} else {
+				const lines = valueBets.slice(0, 5).map((bet) => {
+					return `*${bet.homeTeam} vs ${bet.awayTeam}*\n` +
+						`${bet.outcome} @ ${(bet.polymarketPrice * 100).toFixed(1)}¢ (fair: ${(bet.sharpProb * 100).toFixed(2)}¢)\n` +
+						`Edge: +${(bet.edge * 100).toFixed(1)}%`;
+				});
+				await sendMessage(
+					chatId,
+					`🎯 *Found ${valueBets.length} Value Bets*\n\n${lines.join("\n\n")}\n\n` +
+					`Use \`/sports start\` to begin auto-betting.`,
+					{ parseMode: "Markdown" },
+				);
+			}
+			break;
+		}
+
+		case "auto": {
+			const toggle = args[1]?.toLowerCase();
+			if (toggle === "on") {
+				sportsService.updateSportsConfig(user.id, { autoTrade: true });
+				await sendMessage(chatId, "✅ Auto-trading enabled for sports bets");
+			} else if (toggle === "off") {
+				sportsService.updateSportsConfig(user.id, { autoTrade: false });
+				await sendMessage(chatId, "🛑 Auto-trading disabled");
+			} else {
+				await sendMessage(chatId, "Usage: /sports auto <on|off>");
+			}
+			break;
+		}
+
+		case "edge": {
+			const edge = parseFloat(args[1] || "");
+			if (isNaN(edge) || edge < 1 || edge > 50) {
+				await sendMessage(chatId, "Usage: /sports edge <percent>\n\nExample: /sports edge 5 (for 5% min edge)");
+				return;
+			}
+			sportsService.updateSportsConfig(user.id, { minEdge: edge / 100 });
+			await sendMessage(chatId, `✅ Minimum edge set to ${edge}%`);
+			break;
+		}
+
+		case "maxbet": {
+			const max = parseFloat(args[1] || "");
+			if (isNaN(max) || max < 1) {
+				await sendMessage(chatId, "Usage: /sports maxbet <amount>\n\nExample: /sports maxbet 100");
+				return;
+			}
+			sportsService.updateSportsConfig(user.id, { maxBetUsd: max });
+			await sendMessage(chatId, `✅ Max bet set to $${max}`);
+			break;
+		}
+
+		case "maxperevent": {
+			const max = parseInt(args[1] || "", 10);
+			if (isNaN(max) || max < 1 || max > 50) {
+				await sendMessage(chatId, "Usage: /sports maxperevent <count>\n\nExample: /sports maxperevent 15\n\nRange: 1-50");
+				return;
+			}
+			sportsService.updateSportsConfig(user.id, { maxBetsPerEvent: max });
+			await sendMessage(chatId, `✅ Max bets per event set to ${max}`);
+			break;
+		}
+
+		case "value": {
+			const valueBets = sportsService.getCurrentValueBets();
+			if (valueBets.length === 0) {
+				await sendMessage(chatId, "No value bets found right now.\n\nUse /sports status to check settings.");
+				return;
+			}
+
+			const lines = valueBets.slice(0, 5).map((bet) => {
+				return `*${bet.homeTeam} vs ${bet.awayTeam}*\n` +
+					`${bet.outcome} @ ${(bet.polymarketPrice * 100).toFixed(1)}¢ (fair: ${(bet.sharpProb * 100).toFixed(2)}¢)\n` +
+					`Edge: +${(bet.edge * 100).toFixed(1)}%`;
+			});
+
+			await sendMessage(
+				chatId,
+				`🎯 *Value Bets Found: ${valueBets.length}*\n\n${lines.join("\n\n")}`,
+				{ parseMode: "Markdown" },
+			);
+			break;
+		}
+
+		case "history": {
+			const history = sportsService.getSportsBetHistory(user.id, 10);
+			if (history.length === 0) {
+				await sendMessage(chatId, "No sports betting history yet.");
+				return;
+			}
+
+			const lines = history.map((bet) => {
+				const date = new Date(bet.createdAt * 1000).toLocaleDateString();
+				return `${date} | ${bet.sport} | ${bet.outcome}\n` +
+					`$${bet.size.toFixed(0)} @ ${(bet.edge * 100).toFixed(1)}% edge`;
+			});
+
+			await sendMessage(
+				chatId,
+				`📊 *Recent Sports Bets*\n\n${lines.join("\n\n")}`,
+				{ parseMode: "Markdown" },
+			);
+			break;
+		}
+
+		case "sync": {
+			await sendMessage(chatId, "🔄 Syncing positions with Polymarket...");
+			try {
+				const syncResult = await sportsService.reconcilePositions(user.id);
+				await sendMessage(
+					chatId,
+					`✅ *Sync Complete*\n\n` +
+					`• Positions in DB: ${syncResult.synced}\n` +
+					`• Removed (sold/resolved): ${syncResult.removed}\n` +
+					`• Added from Polymarket: ${syncResult.added}`,
+					{ parseMode: "Markdown" },
+				);
+			} catch (error) {
+				await sendMessage(chatId, `❌ Sync failed: ${error}`);
+			}
+			break;
+		}
+
+		case "help": {
+			await sendMessage(
+				chatId,
+				`🏀 *Sports Value Betting*\n\n` +
+				`Find and bet on Polymarket sports markets where the price is below sharp bookmaker lines.\n\n` +
+				`*Commands:*\n` +
+				`/sports - Show status & settings\n` +
+				`/sports scan - One-time scan for value bets\n` +
+				`/sports start - Start auto-betting monitor\n` +
+				`/sports stop - Stop monitoring\n` +
+				`/sports auto <on|off> - Toggle auto-betting\n` +
+				`/sports enable <sport> - Enable sport (nba, ncaab, nfl)\n` +
+				`/sports disable <sport> - Disable a sport\n` +
+				`/sports edge <percent> - Set min edge (e.g., 5)\n` +
+				`/sports maxbet <amount> - Set max bet size\n` +
+				`/sports maxperevent <count> - Max bets per event\n` +
+				`/sports value - Show current value bets\n` +
+				`/sports history - Show betting history\n` +
+				`/sports sync - Sync DB with Polymarket positions`,
+				{ parseMode: "Markdown" },
+			);
+			break;
+		}
+
+		default:
+			// If no subcommand, show status by default
+			if (!subcommand) {
+				const status = sportsService.getStatus(user.id);
+				const cfg = status.config;
+
+				// Get current exposure
+				const currentExposure = sportsService.getTotalOpenExposure(user.id);
+
+				// Get balance for exposure limit calculation
+				let balance = 0;
+				try {
+					const wallet = copyService.getTradingWallet(user.id);
+					if (wallet?.encryptedCredentials) {
+						const credentials = decryptCredentials(wallet.encryptedCredentials);
+						const client = await tradingService.createClobClient(
+							(credentials as any).privateKey,
+							{
+								apiKey: credentials.apiKey,
+								apiSecret: credentials.apiSecret,
+								passphrase: credentials.passphrase,
+							},
+							wallet.proxyAddress || undefined
+						);
+						const balanceResult = await tradingService.getBalance(client, wallet.proxyAddress || undefined);
+						balance = balanceResult.balance;
+					}
+				} catch {
+					// Ignore balance errors
+				}
+
+				const maxExposure = balance * cfg.maxExposurePct;
+				const exposureAvailable = Math.max(0, maxExposure - currentExposure);
+
+				// Clean up sport names
+				const enabledSports = cfg.sports
+					.map(s => s
+						.replace("basketball_", "")
+						.replace("americanfootball_", "")
+						.replace("icehockey_", "")
+						.replace("baseball_", "")
+						.replace("soccer_", "")
+						.replace("tennis_", "")
+						.replace(/_/g, " ")
+						.toUpperCase()
+					)
+					.join(", ") || "None";
+
+				await sendMessage(
+					chatId,
+					`🏀 *Sports Betting Status*\n\n` +
+					`*Monitoring:* ${status.monitoring ? "✅ Running" : "⏸ Stopped"}\n` +
+					`*Auto-trade:* ${cfg.autoTrade ? "ON" : "OFF"}\n\n` +
+					`*Exposure:*\n` +
+					`• Current: $${currentExposure.toFixed(0)} / $${maxExposure.toFixed(0)} (${(cfg.maxExposurePct * 100).toFixed(0)}% of bankroll)\n` +
+					`• Available: $${exposureAvailable.toFixed(0)}\n\n` +
+					`*Buy Settings:*\n` +
+					`• Min edge: ${(cfg.minEdge * 100).toFixed(1)}%\n` +
+					`• Bet size: $${cfg.minBetUsd} - $${cfg.maxBetUsd}\n` +
+					`• Max per market: $${cfg.maxPerMarket}\n` +
+					`• Books required: ${cfg.booksRequired}+\n\n` +
+					`*Sell Settings:*\n` +
+					`• Min sell edge: ${(cfg.minSellEdge * 100).toFixed(0)}%\n` +
+					`• Max hold price: ${(cfg.maxHoldPrice * 100).toFixed(0)}¢\n\n` +
+					`*Sports:* ${enabledSports}\n\n` +
+					`*Activity:*\n` +
+					`• Today's volume: $${status.todaysVolume.toFixed(0)}\n` +
+					`• Value bets found: ${status.valueBetsFound}\n` +
+					`• Last poll: ${status.lastPoll ? new Date(status.lastPoll).toLocaleTimeString() : "Never"}\n\n` +
+					`_Use /sports help for commands_`,
+					{ parseMode: "Markdown" },
+				);
+			} else {
+				// Unknown subcommand - show help
+				await sendMessage(
+					chatId,
+					`🏀 *Sports Value Betting*\n\n` +
+					`Find and bet on Polymarket sports markets where the price is below sharp bookmaker lines.\n\n` +
+					`*Commands:*\n` +
+					`/sports - Show status & settings\n` +
+					`/sports scan - One-time scan for value bets\n` +
+					`/sports start - Start auto-betting monitor\n` +
+					`/sports stop - Stop monitoring\n` +
+					`/sports auto <on|off> - Toggle auto-betting\n` +
+					`/sports enable <sport> - Enable sport (nba, ncaab, nfl)\n` +
+					`/sports disable <sport> - Disable a sport\n` +
+					`/sports edge <percent> - Set min edge (e.g., 5)\n` +
+					`/sports maxbet <amount> - Set max bet size\n` +
+					`/sports maxperevent <count> - Max bets per event\n` +
+					`/sports value - Show current value bets\n` +
+					`/sports history - Show betting history\n` +
+					`/sports help - Show this message`,
+					{ parseMode: "Markdown" },
+				);
+			}
 	}
 }
 

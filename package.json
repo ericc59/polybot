@@ -12,7 +12,11 @@
 		"start": "bun bot/index.ts start",
 		"setup": "bun bot/index.ts setup",
 		"dev": "bun --watch bot/index.ts start",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"tennis": "bun tennis/index.ts start",
+		"tennis:scan": "bun tennis/index.ts scan",
+		"tennis:status": "bun tennis/index.ts status",
+		"tennis:setup": "bun tennis/index.ts setup"
 	},
 	"devDependencies": {
 		"@types/bun": "latest"

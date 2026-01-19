@@ -8,6 +8,66 @@ import { getMarket, type Trade } from "../api/polymarket";
 
 export type CopyMode = "recommend" | "auto";
 
+// =============================================
+// USER IGNORED MARKETS
+// =============================================
+
+/**
+ * Get all ignored market patterns for a user
+ */
+export function getIgnoredMarkets(userId: number): string[] {
+  const stmt = db().prepare(`
+    SELECT pattern FROM user_ignored_markets WHERE user_id = ?
+  `);
+  const rows = stmt.all(userId) as { pattern: string }[];
+  return rows.map(r => r.pattern);
+}
+
+/**
+ * Add a market pattern to user's ignore list
+ */
+export function addIgnoredMarket(userId: number, pattern: string): boolean {
+  try {
+    const stmt = db().prepare(`
+      INSERT OR IGNORE INTO user_ignored_markets (user_id, pattern)
+      VALUES (?, ?)
+    `);
+    stmt.run(userId, pattern);
+    return true;
+  } catch (error) {
+    logger.error("Failed to add ignored market", error);
+    return false;
+  }
+}
+
+/**
+ * Remove a market pattern from user's ignore list
+ */
+export function removeIgnoredMarket(userId: number, pattern: string): boolean {
+  try {
+    const stmt = db().prepare(`
+      DELETE FROM user_ignored_markets
+      WHERE user_id = ? AND pattern = ?
+    `);
+    stmt.run(userId, pattern);
+    return true;
+  } catch (error) {
+    logger.error("Failed to remove ignored market", error);
+    return false;
+  }
+}
+
+/**
+ * Check if a market should be ignored for a specific user
+ */
+function shouldIgnoreMarket(userId: number, marketTitle: string): boolean {
+  const patterns = getIgnoredMarkets(userId);
+  if (patterns.length === 0) return false;
+
+  const lowerTitle = marketTitle.toLowerCase();
+  return patterns.some(pattern => lowerTitle.includes(pattern.toLowerCase()));
+}
+
 export interface CopySubscription {
   userId: number;
   sourceWallet: string;
@@ -23,6 +83,7 @@ export interface TradingWallet {
   copyPercentage: number;
   maxTradeSize: number | null;
   dailyLimit: number | null;
+  maxPerMarket: number | null;  // Max total exposure per market/event
   proxyAddress: string | null;  // Polymarket proxy wallet address
 }
 
@@ -127,7 +188,7 @@ export function getTradingWallet(userId: number): TradingWallet | null {
       encrypted_credentials as encryptedCredentials,
       copy_enabled as copyEnabled, copy_percentage as copyPercentage,
       max_trade_size as maxTradeSize, daily_limit as dailyLimit,
-      proxy_address as proxyAddress
+      max_per_market as maxPerMarket, proxy_address as proxyAddress
     FROM user_trading_wallets
     WHERE user_id = ?
   `);
@@ -139,6 +200,7 @@ export const SAFE_DEFAULTS = {
 	copyPercentage: 10, // 10% of source trade size (not 100%)
 	maxTradeSize: 10, // $10 max per trade
 	dailyLimit: 100, // $100 daily cap
+	maxPerMarket: 25, // $25 max per market/event
 };
 
 // Ultra-safe test mode limits
@@ -146,6 +208,7 @@ export const TEST_MODE_LIMITS = {
   copyPercentage: 5,       // 5% of source trade
   maxTradeSize: 10,        // $10 max per trade
   dailyLimit: 50,          // $50 daily cap
+  maxPerMarket: 15,        // $15 max per market/event
 };
 
 /**
@@ -172,8 +235,8 @@ export function saveTradingWallet(
       // Insert new wallet with SAFE DEFAULTS
       const stmt = db().prepare(`
         INSERT INTO user_trading_wallets
-        (user_id, wallet_address, encrypted_credentials, copy_percentage, max_trade_size, daily_limit, copy_enabled)
-        VALUES (?, ?, ?, ?, ?, ?, 0)
+        (user_id, wallet_address, encrypted_credentials, copy_percentage, max_trade_size, daily_limit, max_per_market, copy_enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
       `);
       stmt.run(
         userId,
@@ -181,7 +244,8 @@ export function saveTradingWallet(
         encryptedCredentials,
         SAFE_DEFAULTS.copyPercentage,
         SAFE_DEFAULTS.maxTradeSize,
-        SAFE_DEFAULTS.dailyLimit
+        SAFE_DEFAULTS.dailyLimit,
+        SAFE_DEFAULTS.maxPerMarket
       );
     }
     return true;
@@ -199,6 +263,7 @@ export function applyTestModeLimits(userId: number): boolean {
     copyPercentage: TEST_MODE_LIMITS.copyPercentage,
     maxTradeSize: TEST_MODE_LIMITS.maxTradeSize,
     dailyLimit: TEST_MODE_LIMITS.dailyLimit,
+    maxPerMarket: TEST_MODE_LIMITS.maxPerMarket,
     copyEnabled: false, // Start disabled, require explicit enable
   });
 }
@@ -213,6 +278,7 @@ export function updateTradingSettings(
     copyPercentage?: number;
     maxTradeSize?: number | null;
     dailyLimit?: number | null;
+    maxPerMarket?: number | null;
   }
 ): boolean {
   try {
@@ -234,6 +300,10 @@ export function updateTradingSettings(
     if (settings.dailyLimit !== undefined) {
       updates.push("daily_limit = ?");
       values.push(settings.dailyLimit);
+    }
+    if (settings.maxPerMarket !== undefined) {
+      updates.push("max_per_market = ?");
+      values.push(settings.maxPerMarket);
     }
 
     if (updates.length === 0) return true;
@@ -324,14 +394,25 @@ export function updateCopyTradeStatus(
   status: CopyTradeRecord["status"],
   orderId?: string,
   txHash?: string,
-  errorMessage?: string
+  errorMessage?: string,
+  actualSize?: number
 ): void {
-  const stmt = db().prepare(`
-    UPDATE copy_trade_history
-    SET status = ?, order_id = ?, tx_hash = ?, error_message = ?, executed_at = ?
-    WHERE id = ?
-  `);
-  stmt.run(status, orderId || null, txHash || null, errorMessage || null, Date.now() / 1000, id);
+  if (actualSize !== undefined) {
+    // Update with actual fill size
+    const stmt = db().prepare(`
+      UPDATE copy_trade_history
+      SET status = ?, order_id = ?, tx_hash = ?, error_message = ?, executed_at = ?, size = ?
+      WHERE id = ?
+    `);
+    stmt.run(status, orderId || null, txHash || null, errorMessage || null, Date.now() / 1000, actualSize, id);
+  } else {
+    const stmt = db().prepare(`
+      UPDATE copy_trade_history
+      SET status = ?, order_id = ?, tx_hash = ?, error_message = ?, executed_at = ?
+      WHERE id = ?
+    `);
+    stmt.run(status, orderId || null, txHash || null, errorMessage || null, Date.now() / 1000, id);
+  }
 }
 
 /**
@@ -339,15 +420,89 @@ export function updateCopyTradeStatus(
  */
 export function getTodaysCopyTotal(userId: number): number {
   const startOfDay = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
-  // Only count BUY orders for daily limit (money going out)
+  // Only count BUY orders that have a tx_hash (proof of on-chain execution)
 		// For BUY: size is the dollar amount spent
 		const stmt = db().prepare(`
     SELECT COALESCE(SUM(size), 0) as total
     FROM copy_trade_history
-    WHERE user_id = ? AND status = 'executed' AND side = 'BUY' AND created_at >= ?
+    WHERE user_id = ? AND status = 'executed' AND side = 'BUY' AND tx_hash IS NOT NULL AND created_at >= ?
   `);
   const result = stmt.get(userId, startOfDay) as { total: number };
   return result.total;
+}
+
+/**
+ * Reset today's volume by clearing today's copy trade history
+ */
+export function resetTodaysVolume(userId: number): void {
+  const startOfDay = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+  const stmt = db().prepare(`
+    DELETE FROM copy_trade_history
+    WHERE user_id = ? AND created_at >= ?
+  `);
+  stmt.run(userId, startOfDay);
+}
+
+/**
+ * Get total spent on a specific market (conditionId) by a user
+ * Used for max per market limit
+ * Includes both executed trades AND pending trades (to prevent race conditions)
+ */
+export function getMarketTotal(userId: number, marketConditionId: string): number {
+  // Count executed BUY orders plus pending ones (within last 5 min to catch in-flight trades)
+  const fiveMinutesAgo = Date.now() / 1000 - 300;
+  const stmt = db().prepare(`
+    SELECT COALESCE(SUM(size), 0) as total
+    FROM copy_trade_history
+    WHERE user_id = ?
+      AND market_condition_id = ?
+      AND side = 'BUY'
+      AND (
+        (status = 'executed' AND tx_hash IS NOT NULL)
+        OR (status = 'pending' AND created_at >= ?)
+      )
+  `);
+  const result = stmt.get(userId, marketConditionId, fiveMinutesAgo) as { total: number };
+  return result.total;
+}
+
+/**
+ * Debug: Get breakdown of today's copy trades
+ */
+export function getTodaysCopyBreakdown(userId: number): {
+	trades: { title: string; size: number; status: string; hasTxHash: boolean }[];
+	total: number;
+	totalWithTxHash: number;
+} {
+	const startOfDay = Math.floor(new Date().setHours(0, 0, 0, 0) / 1000);
+	const stmt = db().prepare(`
+    SELECT market_title as title, size, status, side, tx_hash
+    FROM copy_trade_history
+    WHERE user_id = ? AND side = 'BUY' AND created_at >= ?
+    ORDER BY created_at DESC
+  `);
+	const trades = stmt.all(userId, startOfDay) as {
+		title: string;
+		size: number;
+		status: string;
+		side: string;
+		tx_hash: string | null;
+	}[];
+
+	const mappedTrades = trades.map((t) => ({
+		title: t.title,
+		size: t.size,
+		status: t.status,
+		hasTxHash: !!t.tx_hash,
+	}));
+
+	const executedTrades = trades.filter((t) => t.status === "executed");
+	const total = executedTrades.reduce((sum, t) => sum + t.size, 0);
+
+	const confirmedTrades = executedTrades.filter((t) => t.tx_hash);
+	const totalWithTxHash = confirmedTrades.reduce((sum, t) => sum + t.size, 0);
+
+	return { trades: mappedTrades, total, totalWithTxHash };
 }
 
 /**
@@ -400,6 +555,12 @@ export async function processCopyTrade(
 
   for (const sub of subscribers) {
     try {
+      // Check if market should be ignored for this user
+      if (shouldIgnoreMarket(sub.userId, trade.title)) {
+        logger.debug(`Skipping ignored market for user ${sub.userId}: ${trade.title}`);
+        continue;
+      }
+
       if (sub.mode === "recommend") {
         // Send recommendation message
         await sendCopyRecommendation(sub.userId, trade, tradeSize);
@@ -461,6 +622,12 @@ async function executeCopyTrade(
   tradeHash: string,
   sourceTradeSize: number
 ): Promise<{ success: boolean; error?: string; copySize?: number; fillPrice?: number }> {
+  // Check if market should be ignored (double-check here in case called directly)
+  if (shouldIgnoreMarket(userId, trade.title)) {
+    logger.info(`Ignoring copy trade for user ${userId} - blacklisted market: ${trade.title}`);
+    return { success: false, error: "Market ignored" };
+  }
+
   // Get user's trading wallet
   const tradingWallet = getTradingWallet(userId);
 
@@ -565,6 +732,38 @@ async function executeCopyTrade(
         errorMessage: "Daily limit exceeded",
       });
       return { success: false, error: "Daily limit exceeded" };
+    }
+  }
+
+  // Check max per market limit (only for BUY orders)
+  if (tradingWallet.maxPerMarket && trade.side === "BUY") {
+    const marketTotal = getMarketTotal(userId, trade.conditionId);
+    const remaining = tradingWallet.maxPerMarket - marketTotal;
+
+    if (remaining <= 0) {
+      // Already at max for this market
+      logCopyTrade({
+        userId,
+        sourceWallet: trade.taker || trade.maker,
+        sourceTradeHash: tradeHash,
+        marketConditionId: trade.conditionId,
+        marketTitle: trade.title,
+        side: trade.side,
+        size: copySize,
+        price: parseFloat(trade.price),
+        status: "skipped",
+        orderId: null,
+        txHash: null,
+        errorMessage: `Market limit reached ($${marketTotal.toFixed(0)}/$${tradingWallet.maxPerMarket})`,
+      });
+      logger.info(`Skipped copy trade - market limit reached for ${trade.title} ($${marketTotal.toFixed(0)}/$${tradingWallet.maxPerMarket})`);
+      return { success: false, error: "Market limit reached" };
+    }
+
+    // Reduce copy size if it would exceed market limit
+    if (copySize > remaining) {
+      logger.info(`Reducing copy size from $${copySize.toFixed(2)} to $${remaining.toFixed(2)} (market limit)`);
+      copySize = remaining;
     }
   }
 
@@ -692,7 +891,9 @@ async function executeCopyTrade(
     });
 
     if (result.success) {
-      updateCopyTradeStatus(recordId, "executed", result.orderId, result.txHash);
+      // Use actual fill amount if available, otherwise use intended copySize
+      const actualFillAmount = result.fillAmount ?? copySize;
+      updateCopyTradeStatus(recordId, "executed", result.orderId, result.txHash, undefined, actualFillAmount);
 
       // Notify user
       const userStmt = db().prepare("SELECT telegram_chat_id FROM users WHERE id = ?");
@@ -700,13 +901,13 @@ async function executeCopyTrade(
 
       const fillPrice = result.fillPrice ?? currentPrice;
       const copyDollarValue = trade.side === "SELL"
-        ? copySize * fillPrice
-        : copySize;
+        ? actualFillAmount * fillPrice
+        : actualFillAmount;
 
       if (user) {
         const valueStr = trade.side === "SELL"
-          ? `${copySize.toFixed(1)} shares`
-          : `$${copySize.toFixed(0)}`;
+          ? `${actualFillAmount.toFixed(1)} shares`
+          : `$${actualFillAmount.toFixed(2)}`;
         const priceStr = `@ ${(fillPrice * 100).toFixed(1)}¢`;
         await sendMessage(
           user.telegram_chat_id,

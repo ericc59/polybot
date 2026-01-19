@@ -187,3 +187,19 @@ INSERT OR IGNORE INTO schema_version (version) VALUES (1);
 
 -- Migration v2: Add proxy wallet support
 ALTER TABLE user_trading_wallets ADD COLUMN proxy_address TEXT;
+
+-- Migration v3: Add max per market limit
+ALTER TABLE user_trading_wallets ADD COLUMN max_per_market REAL;
+
+-- =============================================
+-- USER IGNORED MARKETS (per-user market filtering)
+-- =============================================
+CREATE TABLE IF NOT EXISTS user_ignored_markets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  pattern TEXT NOT NULL,
+  created_at INTEGER DEFAULT (strftime('%s', 'now')),
+  UNIQUE(user_id, pattern)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_ignored_markets_user ON user_ignored_markets(user_id);

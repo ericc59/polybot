@@ -13,6 +13,7 @@ import {
 import * as stripeService from "./services/stripe.service";
 import * as paperService from "./services/paper.service";
 import * as copyService from "./services/copy.service";
+import * as sportsService from "./services/sports.service";
 import {
 	createWebhookHandler,
 	handleUpdate,
@@ -80,6 +81,9 @@ async function runStart() {
 	await getDb();
 	logger.success("Database initialized");
 
+	// Initialize sports betting schema
+	sportsService.initSportsSchema();
+
 	// Initialize paper trading and backfill missing data
 	await paperService.initAndBackfill();
 
@@ -100,6 +104,10 @@ async function runStart() {
 		logger.info("Starting real-time WebSocket monitor...");
 		await startRealtimeMonitor();
 	}
+
+	// Start sports value betting monitor (polls every 5 seconds)
+	logger.info("Starting sports value betting monitor...");
+	sportsService.startMonitoring(1); // Default user ID
 
 	// Start HTTP server (always runs for health checks and Stripe webhooks)
 	Bun.serve({
@@ -181,6 +189,7 @@ async function runStart() {
 		logger.info("Shutting down...");
 		paperService.stopRedemptionMonitor();
 		copyService.stopRealRedemptionMonitor();
+		sportsService.stopMonitoring();
 		if (config.USE_POLLING) {
 			stopMonitor();
 		} else {
@@ -193,6 +202,7 @@ async function runStart() {
 		logger.info("Shutting down...");
 		paperService.stopRedemptionMonitor();
 		copyService.stopRealRedemptionMonitor();
+		sportsService.stopMonitoring();
 		if (config.USE_POLLING) {
 			stopMonitor();
 		} else {

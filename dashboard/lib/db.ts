@@ -281,4 +281,201 @@ export function getTradingAccount(): TradingAccount | null {
   return account;
 }
 
+// =============================================
+// TENNIS BOT DATA
+// =============================================
+
+// Connect to tennis bot's SQLite database (read-only)
+const tennisDbPath = path.join(process.cwd(), '..', 'data', 'tennis.db');
+let tennisDb: Database.Database | null = null;
+
+function getTennisDb(): Database.Database {
+  if (!tennisDb) {
+    try {
+      tennisDb = new Database(tennisDbPath, { readonly: true });
+      tennisDb.pragma('journal_mode = WAL');
+    } catch (error) {
+      console.error('Failed to connect to tennis database:', error);
+      throw error;
+    }
+  }
+  return tennisDb;
+}
+
+export interface TennisMatch {
+  id: number;
+  oddsApiId: string;
+  player1: string;
+  player2: string;
+  commenceTime: number;
+  sportKey: string;
+  polymarketConditionId: string | null;
+  polymarketSlug: string | null;
+  player1TokenId: string | null;
+  player2TokenId: string | null;
+  status: string;
+  walkoverDetectedAt: number | null;
+  ordersPlacedAt: number | null;
+  notes: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TennisTrade {
+  id: number;
+  matchId: number;
+  player1: string;
+  player2: string;
+  side: string;
+  shares: number;
+  price: number;
+  cost: number;
+  profit: number | null;
+  status: string;
+  orderId: string | null;
+  createdAt: number;
+}
+
+export interface TennisStats {
+  trackedMatches: number;
+  todayMatches: number;
+  walkoversDetected: number;
+  totalTrades: number;
+  totalProfit: number;
+  winRate: number;
+  botStatus: 'running' | 'stopped' | 'error';
+}
+
+// Get tennis stats
+export function getTennisStats(): TennisStats {
+  try {
+    const db = getTennisDb();
+
+    const trackedMatches = db.prepare(
+      "SELECT COUNT(*) as count FROM tracked_matches WHERE status NOT IN ('completed', 'ignored')"
+    ).get() as { count: number };
+
+    const todayStart = Math.floor(Date.now() / 1000);
+    const todayEnd = todayStart + 86400;
+    const todayMatches = db.prepare(
+      "SELECT COUNT(*) as count FROM tracked_matches WHERE commence_time >= ? AND commence_time < ? AND status NOT IN ('completed', 'ignored')"
+    ).get(todayStart - 86400, todayEnd) as { count: number };
+
+    const walkoversDetected = db.prepare(
+      'SELECT COUNT(*) as count FROM tracked_matches WHERE walkover_detected_at IS NOT NULL'
+    ).get() as { count: number };
+
+    // Check if trade_history table exists
+    let totalTrades = 0;
+    let totalProfit = 0;
+    try {
+      const tradesResult = db.prepare('SELECT COUNT(*) as count FROM trade_history').get() as { count: number };
+      totalTrades = tradesResult.count;
+
+      const profitResult = db.prepare('SELECT COALESCE(SUM(profit), 0) as profit FROM trade_history').get() as { profit: number };
+      totalProfit = profitResult.profit;
+    } catch {
+      // Table doesn't exist yet
+    }
+
+    return {
+      trackedMatches: trackedMatches.count,
+      todayMatches: todayMatches.count,
+      walkoversDetected: walkoversDetected.count,
+      totalTrades,
+      totalProfit,
+      winRate: 0, // Calculate when we have trades
+      botStatus: 'running', // Would need to check process status
+    };
+  } catch (error) {
+    console.error('Error fetching tennis stats:', error);
+    return {
+      trackedMatches: 0,
+      todayMatches: 0,
+      walkoversDetected: 0,
+      totalTrades: 0,
+      totalProfit: 0,
+      winRate: 0,
+      botStatus: 'error',
+    };
+  }
+}
+
+// Get tennis matches
+export function getTennisMatches(limit = 50): TennisMatch[] {
+  try {
+    const db = getTennisDb();
+
+    const matches = db.prepare(`
+      SELECT
+        id,
+        odds_api_id as oddsApiId,
+        player1,
+        player2,
+        commence_time as commenceTime,
+        sport_key as sportKey,
+        polymarket_condition_id as polymarketConditionId,
+        polymarket_slug as polymarketSlug,
+        player1_token_id as player1TokenId,
+        player2_token_id as player2TokenId,
+        status,
+        walkover_detected_at as walkoverDetectedAt,
+        orders_placed_at as ordersPlacedAt,
+        notes,
+        created_at as createdAt,
+        updated_at as updatedAt
+      FROM tracked_matches
+      WHERE status NOT IN ('completed', 'ignored')
+      ORDER BY commence_time ASC
+      LIMIT ?
+    `).all(limit) as TennisMatch[];
+
+    return matches;
+  } catch (error) {
+    console.error('Error fetching tennis matches:', error);
+    return [];
+  }
+}
+
+// Get tennis trades
+export function getTennisTrades(limit = 50): TennisTrade[] {
+  try {
+    const db = getTennisDb();
+
+    // Check if table exists first
+    const tableExists = db.prepare(`
+      SELECT name FROM sqlite_master WHERE type='table' AND name='trade_history'
+    `).get();
+
+    if (!tableExists) {
+      return [];
+    }
+
+    const trades = db.prepare(`
+      SELECT
+        th.id,
+        th.match_id as matchId,
+        tm.player1,
+        tm.player2,
+        th.side,
+        th.shares,
+        th.price,
+        th.cost,
+        th.profit,
+        th.status,
+        th.order_id as orderId,
+        th.created_at as createdAt
+      FROM trade_history th
+      LEFT JOIN tracked_matches tm ON th.match_id = tm.id
+      ORDER BY th.created_at DESC
+      LIMIT ?
+    `).all(limit) as TennisTrade[];
+
+    return trades;
+  } catch (error) {
+    console.error('Error fetching tennis trades:', error);
+    return [];
+  }
+}
+
 export default db;

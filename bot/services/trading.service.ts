@@ -1,350 +1,39 @@
-import { ClobClient } from "@polymarket/clob-client";
-import { Side, OrderType } from "@polymarket/clob-client";
-import { Wallet } from "@ethersproject/wallet";
-import { JsonRpcProvider } from "@ethersproject/providers";
-import { decryptCredentials } from "../utils/crypto";
+// Re-export core trading functions from shared library
+export {
+	createClobClient,
+	deriveApiKey,
+	isValidPrivateKey,
+	getAddressFromPrivateKey,
+	POLYGON_RPC,
+	CLOB_HOST,
+	CHAIN_ID,
+} from "../../lib/trading/client";
+
+export {
+	getBalance,
+	fetchProxyBalance,
+} from "../../lib/trading/balance";
+
+export {
+	placeLimitOrder,
+	placeMarketOrder,
+	cancelOrder,
+	cancelAllOrders,
+	getOpenOrders,
+	getMarketPrice,
+	calculateMarketPrice,
+} from "../../lib/trading/orders";
+
+export type {
+	TradingWallet,
+	TradeResult,
+	OrderParams,
+	MarketOrderParams,
+} from "../../lib/trading/types";
+
+import type { ClobClient } from "@polymarket/clob-client";
+import { placeMarketOrder as libPlaceMarketOrder } from "../../lib/trading/orders";
 import { logger } from "../utils/logger";
-import { config } from "../config";
-
-// Polygon RPC endpoint
-const POLYGON_RPC = process.env.POLYGON_RPC_URL || "https://polygon-rpc.com";
-const CLOB_HOST = "https://clob.polymarket.com";
-const CHAIN_ID = 137; // Polygon mainnet
-
-export interface TradingWallet {
-  address: string;
-  encryptedCredentials: string;
-}
-
-export interface TradeResult {
-  success: boolean;
-  orderId?: string;
-  txHash?: string;
-  error?: string;
-  fillPrice?: number;  // Approximate fill price
-}
-
-export interface OrderParams {
-  tokenId: string;
-  side: "BUY" | "SELL";
-  size: number; // In shares
-  price: number; // 0-1 probability price
-}
-
-export interface MarketOrderParams {
-  tokenId: string;
-  side: "BUY" | "SELL";
-  amount: number; // USD amount for BUY, shares for SELL
-}
-
-/**
- * Create a CLOB client for a user's trading wallet
- * @param privateKey - The private key of the signing wallet (EOA)
- * @param credentials - API credentials
- * @param proxyAddress - Optional proxy/funder wallet address (for Polymarket proxy wallets)
- */
-export async function createClobClient(
-  privateKey: string,
-  credentials: { apiKey: string; apiSecret: string; passphrase: string },
-  proxyAddress?: string
-): Promise<ClobClient> {
-  const provider = new JsonRpcProvider(POLYGON_RPC);
-  const wallet = new Wallet(privateKey, provider);
-
-  const creds = {
-    key: credentials.apiKey,
-    secret: credentials.apiSecret,
-    passphrase: credentials.passphrase,
-  };
-
-  // SignatureType: 0 = EOA, 1 = POLY_GNOSIS_SAFE, 2 = POLY_PROXY
-  // For Polymarket web users with proxy wallets, use POLY_PROXY (2)
-  if (proxyAddress) {
-    const POLY_PROXY = 2;
-    return new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds, POLY_PROXY, proxyAddress);
-  }
-
-  // For direct EOA wallets, use signature type 0
-  return new ClobClient(CLOB_HOST, CHAIN_ID, wallet, creds, 0);
-}
-
-/**
- * Get user's USDC balance and allowance
- * For proxy wallets, fetches USDC balance directly from Polygon
- */
-export async function getBalance(client: ClobClient, proxyAddress?: string): Promise<{ balance: number; allowance: number }> {
-  // If proxy address provided, fetch USDC balance directly from blockchain
-  if (proxyAddress) {
-    logger.debug(`Fetching balance for proxy wallet: ${proxyAddress}`);
-    try {
-      const balance = await fetchProxyBalance(proxyAddress);
-      logger.debug(`Proxy balance: $${balance.toFixed(2)}`);
-      return { balance, allowance: balance }; // Proxy wallets have pre-approved allowance
-    } catch (error) {
-      logger.error("Failed to get proxy balance", error);
-      // Fall through to try CLOB client
-    }
-  }
-
-  // Standard CLOB client balance check
-  try {
-    const result = await client.getBalanceAllowance();
-    logger.debug(`CLOB balance: ${result.balance}, allowance: ${result.allowance}`);
-    return {
-      balance: parseFloat(result.balance || "0"),
-      allowance: parseFloat(result.allowance || "0"),
-    };
-  } catch (error) {
-    logger.error("Failed to get balance from CLOB", error);
-    return { balance: 0, allowance: 0 };
-  }
-}
-
-/**
- * Fetch USDC balance for a wallet directly from Polygon blockchain
- */
-async function fetchProxyBalance(walletAddress: string): Promise<number> {
-  // USDC contract on Polygon
-  const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-
-  // ERC20 balanceOf function selector + padded address
-  const data = "0x70a08231" + walletAddress.slice(2).toLowerCase().padStart(64, "0");
-
-  const response = await fetch(POLYGON_RPC, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "eth_call",
-      params: [{ to: USDC_ADDRESS, data }, "latest"],
-      id: 1,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`RPC error: ${response.status}`);
-  }
-
-  const result = await response.json() as { result?: string; error?: any };
-
-  if (result.error) {
-    throw new Error(result.error.message || "RPC call failed");
-  }
-
-  // Parse hex result - USDC has 6 decimals
-  const balanceWei = BigInt(result.result || "0x0");
-  return Number(balanceWei) / 1_000_000;
-}
-
-/**
- * Place a limit order
- */
-export async function placeLimitOrder(client: ClobClient, params: OrderParams): Promise<TradeResult> {
-  try {
-    const userOrder = {
-      tokenID: params.tokenId,
-      side: params.side === "BUY" ? Side.BUY : Side.SELL,
-      size: params.size,
-      price: params.price,
-    };
-
-    const result = await client.createAndPostOrder(
-					userOrder,
-					undefined,
-					OrderType.GTC,
-				); // GTC = Good Till Canceled
-
-    logger.info(`Order placed: ${JSON.stringify(result)}`);
-
-    return {
-      success: true,
-      orderId: result.orderID || result.id,
-    };
-  } catch (error: any) {
-    logger.error("Failed to place limit order", error);
-    return {
-      success: false,
-      error: error.message || "Unknown error",
-    };
-  }
-}
-
-/**
- * Place a market order (FOK - Fill or Kill)
- */
-export async function placeMarketOrder(client: ClobClient, params: MarketOrderParams): Promise<TradeResult> {
-  try {
-    // Get current market price before placing order
-    let fillPrice: number | undefined;
-    try {
-      const priceResult = await client.getPrice(params.tokenId, params.side);
-      fillPrice = parseFloat(priceResult.price || "0");
-    } catch {
-      // Price fetch failed, continue without it
-    }
-
-    const userMarketOrder = {
-      tokenID: params.tokenId,
-      side: params.side === "BUY" ? Side.BUY : Side.SELL,
-      amount: params.amount,
-    };
-
-    const result = await client.createAndPostMarketOrder(userMarketOrder, undefined, OrderType.FOK);
-
-    logger.info(`Market order placed: ${JSON.stringify(result)}`);
-
-    return {
-      success: true,
-      orderId: result.orderID || result.id,
-      txHash: result.transactionHash,
-      fillPrice,
-    };
-  } catch (error: any) {
-    // Handle specific error cases
-    const errorMsg = error.message || "Unknown error";
-
-    if (errorMsg === "no match" || errorMsg.includes("no match")) {
-      logger.warn(`No liquidity for market order: ${params.tokenId.slice(0, 20)}...`);
-      return {
-        success: false,
-        error: "No liquidity - no sellers available",
-      };
-    }
-
-    logger.error("Failed to place market order", error);
-    return {
-      success: false,
-      error: errorMsg,
-    };
-  }
-}
-
-/**
- * Cancel an order
- */
-export async function cancelOrder(client: ClobClient, orderId: string): Promise<boolean> {
-  try {
-    await client.cancelOrder({ orderID: orderId });
-    return true;
-  } catch (error) {
-    logger.error(`Failed to cancel order ${orderId}`, error);
-    return false;
-  }
-}
-
-/**
- * Cancel all open orders
- */
-export async function cancelAllOrders(client: ClobClient): Promise<boolean> {
-  try {
-    await client.cancelAll();
-    return true;
-  } catch (error) {
-    logger.error("Failed to cancel all orders", error);
-    return false;
-  }
-}
-
-/**
- * Get open orders
- */
-export async function getOpenOrders(client: ClobClient): Promise<any[]> {
-  try {
-    const result = await client.getOpenOrders();
-    return result || [];
-  } catch (error) {
-    logger.error("Failed to get open orders", error);
-    return [];
-  }
-}
-
-/**
- * Get market price for a token
- */
-export async function getMarketPrice(
-  client: ClobClient,
-  tokenId: string,
-  side: "BUY" | "SELL"
-): Promise<number | null> {
-  try {
-    const result = await client.getPrice(tokenId, side);
-    return parseFloat(result.price || "0");
-  } catch (error) {
-    logger.error(`Failed to get market price for ${tokenId}`, error);
-    return null;
-  }
-}
-
-/**
- * Calculate the price for a market order of given size
- */
-export async function calculateMarketPrice(
-  client: ClobClient,
-  tokenId: string,
-  side: "BUY" | "SELL",
-  amount: number
-): Promise<number | null> {
-  try {
-    const sideEnum = side === "BUY" ? Side.BUY : Side.SELL;
-    const price = await client.calculateMarketPrice(tokenId, sideEnum, amount);
-    return price;
-  } catch (error) {
-    logger.error(`Failed to calculate market price`, error);
-    return null;
-  }
-}
-
-/**
- * Derive API key for a new wallet (first-time setup)
- */
-export async function deriveApiKey(
-  privateKey: string
-): Promise<{ apiKey: string; apiSecret: string; passphrase: string } | null> {
-  try {
-    const provider = new JsonRpcProvider(POLYGON_RPC);
-    const wallet = new Wallet(privateKey, provider);
-
-    // Create client without creds to derive them
-    const client = new ClobClient(CLOB_HOST, CHAIN_ID, wallet);
-    const creds = await client.deriveApiKey();
-
-    return {
-      apiKey: creds.key,
-      apiSecret: creds.secret,
-      passphrase: creds.passphrase,
-    };
-  } catch (error) {
-    logger.error("Failed to derive API key", error);
-    return null;
-  }
-}
-
-/**
- * Validate a private key
- */
-export function isValidPrivateKey(key: string): boolean {
-  try {
-    // Remove 0x prefix if present
-    const cleanKey = key.startsWith("0x") ? key.slice(2) : key;
-    // Check if it's a valid 64-character hex string
-    if (!/^[0-9a-fA-F]{64}$/.test(cleanKey)) {
-      return false;
-    }
-    // Try to create a wallet from it
-    new Wallet(key);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Get wallet address from private key
- */
-export function getAddressFromPrivateKey(privateKey: string): string {
-  const wallet = new Wallet(privateKey);
-  return wallet.address;
-}
 
 /**
  * Fetch positions from Polymarket REST API
@@ -471,15 +160,15 @@ export async function getMarketResolution(conditionId: string): Promise<{
       archived?: boolean;
     };
 
-    // Check if market is resolved (archived means fully resolved)
-    const isResolved = data.archived === true;
+    // Find the winning outcome - Polymarket marks winner BEFORE archiving
+				const winner = data.tokens?.find((t) => t.winner === true);
+
+				// Market is resolved if archived OR if any token is marked as winner
+				const isResolved = data.archived === true || !!winner;
 
     if (!isResolved) {
       return { resolved: false, winningOutcome: null };
     }
-
-    // Find the winning outcome
-    const winner = data.tokens?.find(t => t.winner === true);
 
     return {
       resolved: true,
@@ -509,12 +198,12 @@ export async function redeemPosition(
 
   try {
     // For winning positions, sell at market price (should be ~$1)
-    // Or use redeem function if available
-    const result = await placeMarketOrder(client, {
-      tokenId,
-      side: "SELL",
-      amount: size, // Sell all shares
-    });
+				// Or use redeem function if available
+				const result = await libPlaceMarketOrder(client, {
+					tokenId,
+					side: "SELL",
+					amount: size, // Sell all shares
+				});
 
     return result;
   } catch (error: any) {
