@@ -2077,6 +2077,17 @@ async function handleSports(
 			break;
 		}
 
+		case "exposure": {
+			const pct = parseInt(args[1] || "", 10);
+			if (isNaN(pct) || pct < 1 || pct > 100) {
+				await sendMessage(chatId, "Usage: /sports exposure <percent>\n\nExample: /sports exposure 25 (for 25% of bankroll)\n\nRange: 1-100");
+				return;
+			}
+			sportsService.updateSportsConfig(user.id, { maxExposurePct: pct / 100 });
+			await sendMessage(chatId, `✅ Max exposure set to ${pct}% of bankroll`);
+			break;
+		}
+
 		case "value": {
 			const valueBets = sportsService.getCurrentValueBets();
 			if (valueBets.length === 0) {
@@ -2155,7 +2166,8 @@ async function handleSports(
 				`/sports maxperevent <count> - Max bets per event\n` +
 				`/sports value - Show current value bets\n` +
 				`/sports history - Show betting history\n` +
-				`/sports sync - Sync DB with Polymarket positions`,
+				`/sports sync - Sync DB with Polymarket positions\n` +
+				`/sports exposure <pct> - Set max exposure (% of bankroll)`,
 				{ parseMode: "Markdown" },
 			);
 			break;

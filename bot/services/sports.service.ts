@@ -96,20 +96,25 @@ const ODDS_API_KEY = process.env.ODDS_API_KEY || "";
 const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
 
 export const DEFAULT_SPORTS_CONFIG: SportsConfig = {
-  enabled: true,
-  minEdge: 0.035,         // 3.5% minimum edge to buy
-  minSellEdge: 0.05,      // 5% edge to sell (lock in profits)
-  kellyFraction: 0.25,    // Quarter Kelly
-  maxBetPct: 0.03,        // 3% max per bet
-  maxExposurePct: 0.25,   // 25% max exposure (total open position value)
-  minBetUsd: 0.5,           // $0.5 minimum
-  maxBetUsd: 5,           // $1 maximum per bet
-  maxPerMarket: 25,       // $25 max total exposure per outcome
-  booksRequired: 2,       // Consensus from 2+ books
-  maxBetsPerEvent: 15,    // Max bets per event (prevents correlated bets)
-  sports: ["basketball_nba", "basketball_ncaab", "americanfootball_nfl", "icehockey_nhl"],
-  autoTrade: true,
-  maxHoldPrice: 0.85,     // Auto-sell when bid price exceeds 85¢ (if in profit)
+	enabled: true,
+	minEdge: 0.035, // 3.5% minimum edge to buy
+	minSellEdge: 0.05, // 5% edge to sell (lock in profits)
+	kellyFraction: 0.25, // Quarter Kelly
+	maxBetPct: 0.03, // 3% max per bet
+	maxExposurePct: 0.5, // 25% max exposure (total open position value)
+	minBetUsd: 0.5, // $0.5 minimum
+	maxBetUsd: 5, // $1 maximum per bet
+	maxPerMarket: 25, // $25 max total exposure per outcome
+	booksRequired: 2, // Consensus from 2+ books
+	maxBetsPerEvent: 15, // Max bets per event (prevents correlated bets)
+	sports: [
+		"basketball_nba",
+		"basketball_ncaab",
+		"americanfootball_nfl",
+		"icehockey_nhl",
+	],
+	autoTrade: true,
+	maxHoldPrice: 0.85, // Auto-sell when bid price exceeds 85¢ (if in profit)
 };
 
 // =============================================
@@ -1079,6 +1084,161 @@ function calculateConsensusOdds(
 // VALUE DETECTION
 // =============================================
 
+/**
+ * Find value bets for a single Polymarket event
+ * Used for per-market processing flow
+ */
+async function findValueBetsForEvent(
+	polyEvent: PolymarketSportsEvent,
+	oddsMatches: OddsApiMatch[],
+	config: SportsConfig,
+	debug: boolean = false,
+): Promise<ValueBet[]> {
+	const valueBets: ValueBet[] = [];
+
+	// Check if this event has markets we can trade
+	if (!polyEvent.markets || polyEvent.markets.length === 0) {
+		return [];
+	}
+
+	// Find the moneyline market
+	const moneylineMarket = polyEvent.markets.find((m) => {
+		if (m.groupItemTitle) {
+			const title = m.groupItemTitle.toLowerCase();
+			return title === "winner" || title === "moneyline";
+		}
+		const q = m.question.toLowerCase();
+		if (
+			q.includes("over") ||
+			q.includes("under") ||
+			q.includes("o/u") ||
+			q.includes("total")
+		) {
+			return false;
+		}
+		if (q.includes("spread") || q.includes("handicap") || /[+-]\d/.test(q)) {
+			return false;
+		}
+		return (
+			q.includes(" vs ") ||
+			q.includes(" vs. ") ||
+			q.includes("win") ||
+			q.includes("winner") ||
+			q === polyEvent.title.toLowerCase()
+		);
+	});
+
+	if (!moneylineMarket) {
+		return [];
+	}
+
+	// Try to find odds for this Polymarket event
+	const oddsMatch = findMatchingOddsMatch(polyEvent, oddsMatches, false);
+	if (!oddsMatch) {
+		return [];
+	}
+
+	try {
+		const outcomes = JSON.parse(moneylineMarket.outcomes || "[]") as string[];
+		const tokenIds = JSON.parse(
+			moneylineMarket.clobTokenIds || "[]",
+		) as string[];
+
+		if (outcomes.length !== 2 || tokenIds.length !== 2) {
+			return [];
+		}
+
+		// Skip totals markets
+		const hasOverUnder = outcomes.some((o) => {
+			const lower = o.toLowerCase();
+			return (
+				lower === "over" ||
+				lower === "under" ||
+				lower.startsWith("over ") ||
+				lower.startsWith("under ")
+			);
+		});
+		if (hasOverUnder) {
+			return [];
+		}
+
+		// Fetch real-time prices
+		const polyPrice0 = await fetchClobAskPrice(tokenIds[0]!);
+		const polyPrice1 = await fetchClobAskPrice(tokenIds[1]!);
+
+		if (polyPrice0 === null || polyPrice1 === null) {
+			return [];
+		}
+
+		// Check both outcomes for value
+		for (let i = 0; i < outcomes.length; i++) {
+			const outcomeName = outcomes[i]!;
+			const polyPrice = i === 0 ? polyPrice0 : polyPrice1;
+			const tokenId = tokenIds[i]!;
+
+			const isHomeTeam = outcomeMatchesTeam(outcomeName, oddsMatch.home_team);
+			const isAwayTeam = outcomeMatchesTeam(outcomeName, oddsMatch.away_team);
+
+			let oddsTeamName: string;
+			if (isHomeTeam && !isAwayTeam) {
+				oddsTeamName = oddsMatch.home_team;
+			} else if (isAwayTeam && !isHomeTeam) {
+				oddsTeamName = oddsMatch.away_team;
+			} else {
+				continue;
+			}
+
+			const consensus = calculateConsensusOdds(
+				oddsMatch,
+				oddsTeamName,
+				config.booksRequired,
+				false,
+			);
+			if (!consensus) {
+				continue;
+			}
+
+			const sharpProb = consensus.avgProb;
+			const edge = (sharpProb - polyPrice) / polyPrice;
+
+			// Log edge with color coding
+			if (debug) {
+				logger.edge(outcomeName, edge, config.minEdge);
+			}
+
+			if (edge >= config.minEdge) {
+				const kellyPct = edge / (1 - sharpProb);
+				const recommendedPct = kellyPct * config.kellyFraction;
+				const cappedPct = Math.min(recommendedPct, config.maxBetPct);
+
+				valueBets.push({
+					id: `${oddsMatch.id}-${i}`,
+					matchId: oddsMatch.id,
+					sport: oddsMatch.sport_title,
+					homeTeam: oddsMatch.home_team,
+					awayTeam: oddsMatch.away_team,
+					commenceTime: oddsMatch.commence_time,
+					outcome: outcomeName,
+					sharpOdds: 0,
+					sharpProb,
+					polymarketPrice: polyPrice,
+					edge,
+					expectedValue: edge * polyPrice,
+					recommendedSize: cappedPct,
+					bookmakerConsensus: consensus.bookCount,
+					polymarketTokenId: tokenId,
+					polymarketConditionId: moneylineMarket.conditionId,
+					detectedAt: Math.floor(Date.now() / 1000),
+				});
+			}
+		}
+	} catch {
+		// Invalid JSON, skip
+	}
+
+	return valueBets.sort((a, b) => b.edge - a.edge);
+}
+
 export async function findValueBets(
   oddsMatches: OddsApiMatch[],
   polyEvents: PolymarketSportsEvent[],
@@ -1318,86 +1478,139 @@ async function pollForValueBets(userId: number, config: SportsConfig, debug: boo
 
   try {
     // Note: Auto-reconciliation disabled - it was syncing ALL Polymarket positions
-    // (including non-sports) which inflated exposure calculation.
-    // Use /sports sync manually if needed, but exposure tracking should
-    // only include bets the bot actually placed.
+				// (including non-sports) which inflated exposure calculation.
+				// Use /sports sync manually if needed, but exposure tracking should
+				// only include bets the bot actually placed.
 
-    // Fetch Polymarket sports events FIRST (source of truth)
-    const polyEvents = await fetchPolymarketSportsEvents(config.sports);
-
-    // Fetch odds from Odds API
+				// Fetch all data upfront for efficiency
+				const polyEvents = await fetchPolymarketSportsEvents(config.sports);
     const oddsMatches = await fetchAllConfiguredOdds(config);
+				await fetchLiveScores(config.sports);
 
-    // Fetch live scores for game state tracking
-    await fetchLiveScores(config.sports);
+    // Get open positions for sell opportunity checks
+				const openBets = getOpenSportsBets(userId);
+				const openBetsByMatchId = new Map<string, typeof openBets>();
+				for (const bet of openBets) {
+					const existing = openBetsByMatchId.get(bet.matchId) || [];
+					existing.push(bet);
+					openBetsByMatchId.set(bet.matchId, existing);
+				}
 
-    // Find value bets (with debug logging)
-    currentValueBets = await findValueBets(oddsMatches, polyEvents, config, debug);
+				// Track stats
+				let matchedCount = 0;
+				let valueBetsFound = 0;
+				let betsPlaced = 0;
+				let sellsExecuted = 0;
+				currentValueBets = [];
+
+				// Process each market individually: check value → bet → check sells
+				for (const polyEvent of polyEvents) {
+					// Find value bet for this specific event
+					const eventValueBets = await findValueBetsForEvent(
+						polyEvent,
+						oddsMatches,
+						config,
+						debug,
+					);
+
+					if (eventValueBets.length > 0) {
+						matchedCount++;
+						currentValueBets.push(...eventValueBets);
+						valueBetsFound += eventValueBets.length;
+
+						// Execute bets immediately for this event
+						if (config.autoTrade) {
+							for (const bet of eventValueBets) {
+								const result = await executeValueBet(userId, bet, config);
+								if (result.success) {
+									betsPlaced++;
+								} else if (result.error) {
+									logger.warn(`Skipped ${bet.outcome}: ${result.error}`);
+								}
+							}
+						}
+					}
+
+					// Check sell opportunities for any open positions on this event
+					const eventOpenBets = openBetsByMatchId.get(polyEvent.id) || [];
+					for (const openBet of eventOpenBets) {
+						const sold = await checkSellOpportunityForBet(
+							userId,
+							openBet,
+							config,
+							oddsMatches,
+							debug,
+						);
+						if (sold) sellsExecuted++;
+					}
+				}
+
+    // Also check sells for positions not matched to current poly events
+				// (in case the event ended or was delisted)
+				for (const bet of openBets) {
+					if (!polyEvents.find((e) => e.id === bet.matchId)) {
+						await checkSellOpportunityForBet(
+							userId,
+							bet,
+							config,
+							oddsMatches,
+							debug,
+						);
+					}
+				}
 
     // Convert poly events to tracked events for dashboard
-    currentTrackedEvents = polyEvents.map((event) => {
-      // Detect sport from slug
-      const sport = detectSportFromSlug(event.slug);
+				currentTrackedEvents = polyEvents.map((event) => {
+					const sport = detectSportFromSlug(event.slug);
+					const titleParts = event.title.split(/ vs\.? /i);
+					const homeTeam = titleParts[1]?.trim() || event.title;
+					const awayTeam = titleParts[0]?.trim() || "";
 
-      // Parse team names from title (e.g., "Lakers vs Celtics")
-      const titleParts = event.title.split(/ vs\.? /i);
-      const homeTeam = titleParts[1]?.trim() || event.title;
-      const awayTeam = titleParts[0]?.trim() || "";
+					const moneylineMarket = event.markets?.find(
+						(m) => m.groupItemTitle === "Winner" || !m.groupItemTitle,
+					);
+					let outcomes: TrackedEvent["outcomes"] = [];
 
-      // Get moneyline market outcomes and prices
-      const moneylineMarket = event.markets?.find(
-        (m) => m.groupItemTitle === "Winner" || !m.groupItemTitle
-      );
-      let outcomes: TrackedEvent["outcomes"] = [];
+					if (moneylineMarket) {
+						try {
+							const outcomeNames = JSON.parse(moneylineMarket.outcomes || "[]");
+							const outcomePrices = JSON.parse(
+								moneylineMarket.outcomePrices || "[]",
+							);
+							const tokenIds = JSON.parse(moneylineMarket.clobTokenIds || "[]");
 
-      if (moneylineMarket) {
-        try {
-          const outcomeNames = JSON.parse(moneylineMarket.outcomes || "[]");
-          const outcomePrices = JSON.parse(moneylineMarket.outcomePrices || "[]");
-          const tokenIds = JSON.parse(moneylineMarket.clobTokenIds || "[]");
+							outcomes = outcomeNames.map((name: string, i: number) => ({
+								name,
+								price: parseFloat(outcomePrices[i] || "0"),
+								tokenId: tokenIds[i] || "",
+							}));
+						} catch {
+							// Parsing failed, leave empty
+						}
+					}
 
-          outcomes = outcomeNames.map((name: string, i: number) => ({
-            name,
-            price: parseFloat(outcomePrices[i] || "0"),
-            tokenId: tokenIds[i] || "",
-          }));
-        } catch {
-          // Parsing failed, leave empty
-        }
-      }
+					const valueBet = currentValueBets.find(
+						(vb) => vb.matchId === event.id,
+					);
 
-      // Check if this event has a value bet
-      const valueBet = currentValueBets.find((vb) => vb.matchId === event.id);
+					return {
+						id: event.id,
+						slug: event.slug,
+						sport,
+						title: event.title,
+						homeTeam,
+						awayTeam,
+						commenceTime: event.startDate,
+						outcomes,
+						hasValueBet: !!valueBet,
+						valueBetEdge: valueBet?.edge,
+					};
+				});
 
-      return {
-        id: event.id,
-        slug: event.slug,
-        sport,
-        title: event.title,
-        homeTeam,
-        awayTeam,
-        commenceTime: event.startDate,
-        outcomes,
-        hasValueBet: !!valueBet,
-        valueBetEdge: valueBet?.edge,
-      };
-    });
-
-    logger.info(`Sports poll: ${oddsMatches.length} matches, ${polyEvents.length} Polymarket events, ${currentValueBets.length} value bets found`);
+    logger.info(
+					`Sports poll: ${oddsMatches.length} odds, ${polyEvents.length} events, ${valueBetsFound} value bets, ${betsPlaced} placed, ${sellsExecuted} sold`,
+				);
     writeStatusFile();
-
-    // Auto-trade buys if enabled
-    if (config.autoTrade && currentValueBets.length > 0) {
-      for (const bet of currentValueBets) {
-        const result = await executeValueBet(userId, bet, config);
-        if (!result.success && result.error) {
-          logger.warn(`Skipped ${bet.outcome}: ${result.error}`);
-        }
-      }
-    }
-
-    // Check for sell opportunities on open positions
-    await checkSellOpportunities(userId, config, oddsMatches, debug);
   } catch (error) {
     logger.error("Sports poll error", error);
   }
@@ -1736,6 +1949,189 @@ export function markBetSold(betId: number, sellPrice: number, profit: number): v
   } catch (error) {
     logger.error("Failed to mark bet as sold", error);
   }
+}
+
+/**
+ * Check sell opportunity for a single bet
+ * Returns true if the bet was sold
+ */
+async function checkSellOpportunityForBet(
+	userId: number,
+	bet: OpenBet,
+	config: SportsConfig,
+	oddsMatches: OddsApiMatch[],
+	debug: boolean = false,
+): Promise<boolean> {
+	// Get current bid price (what we'd get if we sell)
+	const bidPrice = await fetchClobBidPrice(bet.tokenId);
+	if (bidPrice === null) return false;
+
+	// CHECK 0a: Auto-redeem - sell if price >= 99¢ (market resolved, we won)
+	if (bidPrice >= 0.99) {
+		const profit = bet.shares * bidPrice - bet.size;
+		logger.info(
+			`✅ AUTO-REDEEM: ${bet.outcome} @ ${(bidPrice * 100).toFixed(0)}¢ | Winner! Profit: $${profit.toFixed(2)}`,
+		);
+
+		if (config.autoTrade) {
+			await executeRedeemSell(userId, bet, bidPrice);
+			return true;
+		}
+		return false;
+	}
+
+	// CHECK 0b: Auto-mark loser - if price <= 1¢ (market resolved, we lost)
+	if (bidPrice <= 0.01) {
+		logger.info(
+			`❌ LOSER: ${bet.outcome} @ ${(bidPrice * 100).toFixed(1)}¢ | Loss: -$${bet.size.toFixed(2)}`,
+		);
+		markBetLost(bet.id);
+		return false;
+	}
+
+	// CHECK 1: Game-state-based take-profit
+	const profitPct = (bidPrice - bet.buyPrice) / bet.buyPrice;
+
+	// Find the match in oddsMatches to get commence time and sport key
+	const oddsMatch = oddsMatches.find((m) => m.id === bet.matchId);
+
+	// Map bet's sport name to sport key (Odds API format)
+	const sportKeyFromBet = bet.sport.toLowerCase().includes("nba")
+		? "basketball_nba"
+		: bet.sport.toLowerCase().includes("ncaa")
+			? "basketball_ncaab"
+			: bet.sport.toLowerCase().includes("cbb")
+				? "basketball_ncaab"
+				: bet.sport.toLowerCase().includes("nfl")
+					? "americanfootball_nfl"
+					: bet.sport.toLowerCase().includes("cfb")
+						? "americanfootball_ncaaf"
+						: bet.sport.toLowerCase().includes("nhl")
+							? "icehockey_nhl"
+							: bet.sport.toLowerCase().includes("mlb")
+								? "baseball_mlb"
+								: "unknown";
+
+	// Get game state (from live scores cache + time estimation)
+	const commenceTime = oddsMatch?.commence_time || "";
+	const sportKey = oddsMatch?.sport_key || sportKeyFromBet;
+	const gameState = getLiveGameState(bet.matchId, sportKey, commenceTime);
+
+	// Log game state for debugging
+	if (debug && gameState.isLive) {
+		const scoreStr = gameState.hasScores
+			? `${gameState.homeScore}-${gameState.awayScore} (diff: ${gameState.scoreDiff})`
+			: "no live score";
+		const timeStr =
+			gameState.minutesRemaining !== null
+				? `~${gameState.minutesRemaining.toFixed(0)}min left`
+				: "time unknown";
+		logger.info(
+			`  ${bet.outcome}: +${(profitPct * 100).toFixed(0)}% | ${scoreStr} | ${timeStr}`,
+		);
+	}
+
+	// Check if we should take profit based on game state
+	const takeProfitDecision = shouldTakeProfitOnGameState(
+		profitPct,
+		gameState,
+		sportKey,
+	);
+
+	if (takeProfitDecision.shouldSell) {
+		const profitPctStr = (profitPct * 100).toFixed(0);
+		logger.info(
+			`🎯 TAKE PROFIT: ${bet.outcome} @ ${(bidPrice * 100).toFixed(0)}¢ (entry: ${(bet.buyPrice * 100).toFixed(0)}¢) | +${profitPctStr}% | ${takeProfitDecision.reason}`,
+		);
+
+		if (config.autoTrade) {
+			await executeTakeProfitSell(userId, bet, bidPrice);
+			return true;
+		}
+		return false;
+	}
+
+	// maxHoldPrice threshold - but ONLY in risky game situations
+	if (bidPrice >= config.maxHoldPrice && profitPct > 0) {
+		const isBasketball = sportKey.includes("basketball");
+		const isFootball = sportKey.includes("football");
+		const isHockey = sportKey.includes("hockey");
+
+		const crunchTimeMinutes = isBasketball
+			? 5
+			: isFootball
+				? 8
+				: isHockey
+					? 5
+					: 10;
+		const closeGamePoints = isBasketball
+			? 10
+			: isFootball
+				? 8
+				: isHockey
+					? 2
+					: 5;
+
+		const minRemaining = gameState.minutesRemaining;
+		const scoreDiff = gameState.scoreDiff;
+		const inLateGame =
+			minRemaining !== null && minRemaining <= crunchTimeMinutes * 2;
+		const isCloseGame = scoreDiff !== null && scoreDiff <= closeGamePoints;
+		const gameStateUnknown = !gameState.isLive || minRemaining === null;
+
+		const shouldSellAtThreshold =
+			gameStateUnknown || (isCloseGame && inLateGame);
+
+		if (shouldSellAtThreshold) {
+			const profitPctStr = (profitPct * 100).toFixed(0);
+			const reason = gameStateUnknown
+				? "no game state"
+				: `close game (${scoreDiff} pts) in late stages`;
+			logger.info(
+				`🎯 TAKE PROFIT (price threshold): ${bet.outcome} @ ${(bidPrice * 100).toFixed(0)}¢ | +${profitPctStr}% | ${reason}`,
+			);
+
+			if (config.autoTrade) {
+				await executeTakeProfitSell(userId, bet, bidPrice);
+				return true;
+			}
+			return false;
+		}
+	}
+
+	// CHECK 2: Edge-based sell
+	if (!oddsMatch) return false;
+
+	const consensus = calculateConsensusOdds(
+		oddsMatch,
+		bet.outcome,
+		config.booksRequired,
+		false,
+	);
+	if (!consensus) return false;
+
+	const fairValue = consensus.avgProb;
+	const sellEdge = (bidPrice - fairValue) / fairValue;
+
+	if (debug) {
+		logger.info(
+			`  ${bet.outcome}: bid=${(bidPrice * 100).toFixed(1)}¢, fair=${(fairValue * 100).toFixed(1)}¢, sell edge=${(sellEdge * 100).toFixed(1)}%`,
+		);
+	}
+
+	// Must be in profit AND have positive sell edge
+	if (sellEdge >= config.minSellEdge && profitPct > 0) {
+		logger.info(
+			`💰 SELL OPPORTUNITY: ${bet.outcome} @ ${(bidPrice * 100).toFixed(0)}¢ (fair: ${(fairValue * 100).toFixed(0)}¢) | Edge: +${(sellEdge * 100).toFixed(1)}% | Profit: +${(profitPct * 100).toFixed(0)}%`,
+		);
+
+		if (config.autoTrade) {
+			await executeSellBet(userId, bet, bidPrice);
+			return true;
+		}
+	}
+
+	return false;
 }
 
 async function checkSellOpportunities(

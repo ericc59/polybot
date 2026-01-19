@@ -5,10 +5,19 @@ import { POLYGON_RPC } from "./client";
 // USDC contract on Polygon
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
+// Balance cache to avoid rate limiting (30 second TTL)
+const balanceCache = new Map<string, { balance: number; timestamp: number }>();
+const BALANCE_CACHE_TTL = 30000; // 30 seconds
+
 /**
  * Fetch USDC balance for a wallet directly from Polygon blockchain
  */
 export async function fetchProxyBalance(walletAddress: string): Promise<number> {
+  // Check cache first
+  const cached = balanceCache.get(walletAddress.toLowerCase());
+  if (cached && Date.now() - cached.timestamp < BALANCE_CACHE_TTL) {
+    return cached.balance;
+  }
   // ERC20 balanceOf function selector + padded address
   const data = "0x70a08231" + walletAddress.slice(2).toLowerCase().padStart(64, "0");
 
@@ -35,7 +44,12 @@ export async function fetchProxyBalance(walletAddress: string): Promise<number> 
 
   // Parse hex result - USDC has 6 decimals
   const balanceWei = BigInt(result.result || "0x0");
-  return Number(balanceWei) / 1_000_000;
+  const balance = Number(balanceWei) / 1_000_000;
+
+  // Cache the result
+  balanceCache.set(walletAddress.toLowerCase(), { balance, timestamp: Date.now() });
+
+  return balance;
 }
 
 /**
