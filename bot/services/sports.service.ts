@@ -8,6 +8,43 @@ import * as userRepo from "../db/repositories/user.repo";
 import { writeFileSync, mkdirSync, existsSync } from "fs";
 import { join, dirname } from "path";
 
+// Import from new modular structure
+import type {
+  OddsApiMatch,
+  ValueBet,
+  SportsConfig,
+  PolymarketSportsEvent,
+  TrackedEvent,
+  SportsStatus,
+  BookData,
+  OpenBet,
+  LiveScore,
+} from "./sports/types";
+import {
+  DEFAULT_SPORTS_CONFIG,
+  ODDS_API_KEY,
+  ODDS_API_BASE,
+  SHARP_BOOKS,
+  MAX_ODDS_AGE_MS,
+  GAME_DURATIONS,
+  POLYMARKET_SERIES_IDS,
+  POLYMARKET_SLUG_PREFIXES,
+} from "./sports/config";
+
+// Re-export types for external consumers
+export type {
+  OddsApiMatch,
+  ValueBet,
+  SportsConfig,
+  PolymarketSportsEvent,
+  TrackedEvent,
+  SportsStatus,
+  BookData,
+  OpenBet,
+  LiveScore,
+};
+export { DEFAULT_SPORTS_CONFIG };
+
 // =============================================
 // RETRY UTILITY
 // =============================================
@@ -66,165 +103,6 @@ async function withRetry<T>(
 }
 
 // =============================================
-// TYPES
-// =============================================
-
-export interface OddsApiMatch {
-  id: string;
-  sport_key: string;
-  sport_title: string;
-  commence_time: string;
-  home_team: string;
-  away_team: string;
-  bookmakers: Array<{
-    key: string;
-    title: string;
-    last_update: string;
-    markets: Array<{
-      key: string;
-      last_update: string;
-      outcomes: Array<{
-        name: string;
-        price: number;
-      }>;
-    }>;
-  }>;
-}
-
-export interface ValueBet {
-  id: string;
-  matchId: string;
-  sport: string;
-  homeTeam: string;
-  awayTeam: string;
-  commenceTime: string;
-  outcome: string;
-  sharpOdds: number;
-  sharpProb: number;
-  polymarketPrice: number;
-  edge: number;
-  expectedValue: number;
-  recommendedSize: number;
-  bookmakerConsensus: number;
-  polymarketTokenId: string;
-  polymarketConditionId: string;
-  polymarketSlug?: string;  // Event slug for URL links
-  detectedAt: number;
-  // New fields for improved confidence tracking
-  consensusVariance?: number;  // Variance in book probabilities (lower = more confident)
-  dynamicMinEdge?: number;     // The dynamic edge threshold used for this bet
-  // Full book breakdown for transparency
-  bookData?: Array<{ key: string; odds: number; rawProb: number; fairProb: number; vig: number }>;
-}
-
-export interface SportsConfig {
-		enabled: boolean;
-		minEdge: number;
-		minSellEdge: number;
-		minSellProfit: number; // Minimum profit % to sell (e.g., 0.05 = 5%)
-		kellyFraction: number;
-		maxBetPct: number;
-		maxExposurePct: number; // Max % of bankroll in open positions
-		minBetUsd: number;
-		maxBetUsd: number;
-		maxPerMarket: number;
-		sharesPerBet: number; // Fixed number of shares per bet (if > 0, overrides dollar-based sizing)
-		maxSharesPerMarket: number; // Max shares per outcome (if sharesPerBet > 0)
-		booksRequired: number;
-		maxBetsPerEvent: number;
-		sports: string[];
-		autoTrade: boolean;
-		maxHoldPrice: number; // Auto-sell when bid price exceeds this (e.g., 0.85 = 85¢)
-		minPrice: number; // Don't bet on outcomes below this price (e.g., 0.25 = 25¢, avoids extreme underdogs)
-		// Improvement 1: Dynamic edge thresholds
-		dynamicEdgeEnabled: boolean; // Enable dynamic edge thresholds based on book consensus
-		minEdge4Books: number;  // Min edge when 4+ books agree (lower = more confident)
-		minEdge3Books: number;  // Min edge when 3 books agree
-		minEdge2Books: number;  // Min edge when only 2 books agree (higher = less confident)
-		maxVarianceForLowEdge: number; // Max variance in book probs to use low edge threshold
-		// Improvement 2: Edge-proportional sizing
-		edgeProportionalSizing: boolean; // Scale position size with edge magnitude
-		maxEdgeMultiplier: number; // Max multiplier for high-edge bets (e.g., 3x)
-		// Improvement 3: Edge reversal exit
-		edgeReversalEnabled: boolean; // Sell if sharp edge goes negative
-		edgeReversalThreshold: number; // Sell if edge drops below this (e.g., -0.02 = -2%)
-		// Improvement 5: Correlated position limits
-		correlationEnabled: boolean; // Apply correlation discount to correlated positions
-		sameEventCorrelation: number; // Correlation factor for bets on same event (e.g., 0.8)
-		sameDayCorrelation: number; // Correlation factor for bets on same day (e.g., 0.3)
-		// Pre-game buffer: skip betting in danger zone before tipoff
-		preGameBufferMinutes: number; // Skip bets within X minutes of game start (0 = disabled)
-	}
-
-interface PolymarketSportsEvent {
-  id: string;
-  slug: string;
-  title: string;
-  startDate: string;
-  endDate: string;
-  markets?: Array<{
-    id: string;
-    question: string;
-    conditionId: string;
-    outcomes: string;
-    outcomePrices: string;
-    clobTokenIds: string;
-    groupItemTitle?: string; // "Winner", "Over/Under 220.5", "Spread", etc.
-  }>;
-}
-
-// =============================================
-// CONFIG
-// =============================================
-
-const ODDS_API_KEY = process.env.ODDS_API_KEY || "";
-const ODDS_API_BASE = "https://api.the-odds-api.com/v4";
-
-export const DEFAULT_SPORTS_CONFIG: SportsConfig = {
-	enabled: true,
-	minEdge: 0.035, // 3.5% minimum edge to buy (fallback when dynamic disabled)
-	minSellEdge: 0.05, // 5% edge to sell (lock in profits)
-	minSellProfit: 0.05, // 5% minimum profit to sell
-	kellyFraction: 0.25, // Quarter Kelly
-	maxBetPct: 0.03, // 3% max per bet
-	maxExposurePct: 0.5, // 25% max exposure (total open position value)
-	minBetUsd: 0.5, // $0.5 minimum
-	maxBetUsd: 5, // $1 maximum per bet
-	maxPerMarket: 25, // $25 max total exposure per outcome
-	sharesPerBet: 25, // Fixed 25 shares per bet (set to 0 to use dollar-based sizing)
-	maxSharesPerMarket: 100, // Max 100 shares per outcome
-	booksRequired: 2, // Consensus from 2+ books
-	maxBetsPerEvent: 15, // Max bets per event (prevents correlated bets)
-	sports: [
-		"basketball_nba",
-		"basketball_ncaab",
-		"americanfootball_nfl",
-		"icehockey_nhl",
-	],
-	autoTrade: true, // Entries enabled, all exits disabled
-	maxHoldPrice: 1.0, // DISABLED - was causing unwanted sells at 85¢
-	minPrice: 0.25, // Don't bet on outcomes below 25¢ (avoid extreme underdogs)
-	// Improvement 1: Dynamic edge thresholds based on confidence
-	dynamicEdgeEnabled: false, // DISABLED - use single minEdge threshold
-	minEdge4Books: 0.025,  // 2.5% edge when 4+ books agree (high confidence)
-	minEdge3Books: 0.035,  // 3.5% edge when 3 books agree (medium confidence)
-	minEdge2Books: 0.05,   // 5% edge when only 2 books agree (low confidence)
-	maxVarianceForLowEdge: 0.02, // Max 2% variance to qualify for lower edge threshold
-	// Improvement 2: Edge-proportional position sizing
-	edgeProportionalSizing: true,
-	maxEdgeMultiplier: 3, // Up to 3x size for high-edge bets
-	// Improvement 3: Edge reversal exit
-	edgeReversalEnabled: false, // Disabled - exit methodology TBD
-	edgeReversalThreshold: -0.02, // Sell if edge drops below -2%
-	// Improvement 5: Correlated position limits
-	correlationEnabled: true,
-	sameEventCorrelation: 0.8, // High correlation for same event (e.g., same game different bets)
-	sameDayCorrelation: 0.3,   // Medium correlation for same day bets
-	// Pre-game buffer: avoid danger zone right before tipoff
-	preGameBufferMinutes: 30, // Skip bets within 30 min of start (but allow live betting)
-};
-
-// =============================================
 // STATE
 // =============================================
 
@@ -232,24 +110,6 @@ let isMonitoring = false;
 let currentValueBets: ValueBet[] = [];
 let currentTrackedEvents: TrackedEvent[] = [];
 let lastPollTime = 0;
-
-// Tracked event for dashboard display
-interface TrackedEvent {
-  id: string;
-  slug: string;
-  sport: string;
-  title: string;
-  homeTeam: string;
-  awayTeam: string;
-  commenceTime: string;
-  outcomes: Array<{
-    name: string;
-    price: number;
-    tokenId: string;
-  }>;
-  hasValueBet: boolean;
-  valueBetEdge?: number;
-}
 
 // Status file for dashboard to read
 const STATUS_FILE_PATH = join(process.cwd(), "data", "sports-status.json");
@@ -308,7 +168,7 @@ export async function fetchOddsForSport(sportKey: string): Promise<OddsApiMatch[
         throw error;
       }
 
-      return await response.json();
+      return await response.json() as OddsApiMatch[];
     });
   } catch (error) {
     logger.error("Failed to fetch odds", error);
@@ -319,21 +179,6 @@ export async function fetchOddsForSport(sportKey: string): Promise<OddsApiMatch[
 // =============================================
 // LIVE SCORES (Odds API)
 // =============================================
-
-export interface LiveScore {
-  id: string;
-  sport_key: string;
-  sport_title: string;
-  commence_time: string;
-  completed: boolean;
-  home_team: string;
-  away_team: string;
-  scores: Array<{
-    name: string;
-    score: string;
-  }> | null;
-  last_update: string | null;
-}
 
 // Game duration in minutes by sport
 const GAME_DURATION_MINUTES: Record<string, number> = {
@@ -625,26 +470,6 @@ export async function fetchAllConfiguredOdds(config: SportsConfig): Promise<Odds
 // POLYMARKET SPORTS EVENTS
 // =============================================
 
-// Polymarket series IDs for sports leagues
-const POLYMARKET_SERIES_IDS: Record<string, number> = {
-  "basketball_nba": 10345,
-  "basketball_ncaab": 10470, // CBB (College Basketball - Men's)
-  "americanfootball_nfl": 10187,
-  "americanfootball_ncaaf": 10210,
-  "baseball_mlb": 3,
-  "icehockey_nhl": 10346,
-};
-
-// Slug prefixes for sports (fallback when series_id doesn't work)
-const POLYMARKET_SLUG_PREFIXES: Record<string, string> = {
-  "basketball_nba": "nba-",
-  "basketball_ncaab": "cbb-",
-  "americanfootball_nfl": "nfl-",
-  "americanfootball_ncaaf": "cfb-",
-  "baseball_mlb": "mlb-",
-  "icehockey_nhl": "nhl-",
-};
-
 // Detect sport from Polymarket slug
 function detectSportFromSlug(slug: string): string {
   if (slug.startsWith("nba-")) return "basketball_nba";
@@ -677,7 +502,7 @@ async function fetchClobAskPrice(tokenId: string): Promise<number | null> {
         error.status = response.status;
         throw error;
       }
-      const data = await response.json();
+      const data = await response.json() as { price: string };
       return parseFloat(data.price);
     }, { maxRetries: 2 }); // Fewer retries for price checks (speed matters)
   } catch {
@@ -696,7 +521,7 @@ async function fetchClobBidPrice(tokenId: string): Promise<number | null> {
         error.status = response.status;
         throw error;
       }
-      const data = await response.json();
+      const data = await response.json() as { price: string };
       return parseFloat(data.price);
     }, { maxRetries: 2 });
   } catch {
@@ -732,7 +557,7 @@ export async function fetchPolymarketSportsEvents(sports: string[]): Promise<Pol
         continue;
       }
 
-      const events = await response.json();
+      const events = await response.json() as PolymarketSportsEvent[];
       logger.info(`Polymarket: Found ${events.length} events for ${sport} (today: ${today})`);
       allEvents.push(...events);
     } catch (error) {
@@ -950,17 +775,19 @@ function generateCollegeAbbrevs(teamName: string): string[] {
   }
 
   // Add single word with 't' suffix for some schools (charlt for Charlotte)
-  if (words.length === 1 && words[0].length >= 5) {
-    abbrevs.push(words[0].slice(0, 5) + "t");
-    abbrevs.push(words[0].slice(0, 6) + "t");
-  }
-
-  // Consonant-heavy abbreviations for single word schools (Memphis -> mphs)
-  if (words.length === 1 && words[0].length >= 4) {
-    const consonants = words[0].replace(/[aeiou]/g, "");
-    if (consonants.length >= 3) {
-      abbrevs.push(consonants.slice(0, 4)); // mphs for memphis
-      abbrevs.push(consonants.slice(0, 3));
+  if (words.length === 1) {
+    const word = words[0]!;
+    if (word.length >= 5) {
+      abbrevs.push(word.slice(0, 5) + "t");
+      abbrevs.push(word.slice(0, 6) + "t");
+    }
+    // Consonant-heavy abbreviations for single word schools (Memphis -> mphs)
+    if (word.length >= 4) {
+      const consonants = word.replace(/[aeiou]/g, "");
+      if (consonants.length >= 3) {
+        abbrevs.push(consonants.slice(0, 4)); // mphs for memphis
+        abbrevs.push(consonants.slice(0, 3));
+      }
     }
   }
 
@@ -1130,14 +957,6 @@ function americanToProb(americanOdds: number): number {
   }
 }
 
-// Sharp books only - in order of preference (pinnacle is sharpest when available)
-const SHARP_BOOKS = ["pinnacle", "lowvig", "betonlineag", "fanduel", "draftkings"];
-
-// Max age for bookmaker odds (2 minutes - lines can move fast)
-const MAX_ODDS_AGE_MS = 2 * 60 * 1000;
-
-type BookData = { key: string; odds: number; rawProb: number; fairProb: number; vig: number };
-
 function calculateConsensusOdds(
   match: OddsApiMatch,
   outcome: string,
@@ -1302,9 +1121,10 @@ async function findValueBetsForEvent(
 	if (!polyEvent.markets || polyEvent.markets.length === 0) {
 		return [];
 	}
+	const markets = polyEvent.markets;
 
 	// Find the moneyline market
-	const moneylineMarket = polyEvent.markets.find((m) => {
+	const moneylineMarket = markets.find((m) => {
 		if (m.groupItemTitle) {
 			const title = m.groupItemTitle.toLowerCase();
 			return title === "winner" || title === "moneyline";
@@ -1497,18 +1317,18 @@ export async function findValueBets(
   // START FROM POLYMARKET (source of truth)
   for (const polyEvent of polyEvents) {
     // Check if this event has markets we can trade
-    const hasNoMarkets = !polyEvent.markets || polyEvent.markets.length === 0;
-    if (hasNoMarkets) {
+    if (!polyEvent.markets || polyEvent.markets.length === 0) {
       noMarketCount++;
       if (debug) {
         logger.debug(`  No markets on this event`);
       }
       continue;
     }
+    const markets = polyEvent.markets; // Now TypeScript knows this is defined
 
 				// Find the moneyline market using groupItemTitle field (most reliable)
 				// groupItemTitle = "Winner" for moneyline, "Over/Under X" for totals, "Spread" for spreads
-				const moneylineMarket = polyEvent.markets.find((m) => {
+				const moneylineMarket = markets.find((m) => {
 					// Primary: Use groupItemTitle if available
 					if (m.groupItemTitle) {
 						const title = m.groupItemTitle.toLowerCase();
@@ -1551,7 +1371,7 @@ export async function findValueBets(
 				if (!moneylineMarket) {
 					noMarketCount++;
 					if (debug) {
-						const marketQuestions = polyEvent.markets
+						const marketQuestions = markets
 							.map((m) => m.question)
 							.slice(0, 3);
 						logger.debug(
@@ -2505,21 +2325,6 @@ export function getSportsBetHistory(userId: number, limit: number = 20): Array<{
 // =============================================
 // SELL OPPORTUNITIES
 // =============================================
-
-interface OpenBet {
-  id: number;
-  userId: number;
-  matchId: string;
-  sport: string;
-  homeTeam: string;
-  awayTeam: string;
-  outcome: string;
-  tokenId: string;
-  shares: number;
-  buyPrice: number;
-  size: number;
-  commenceTime: number | null; // Unix timestamp when game starts
-}
 
 export function getOpenSportsBets(userId: number): OpenBet[] {
   try {
