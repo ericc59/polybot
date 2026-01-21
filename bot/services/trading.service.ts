@@ -147,6 +147,7 @@ export async function getAllPositions(client: ClobClient, proxyAddress?: string)
 export async function getMarketResolution(conditionId: string): Promise<{
   resolved: boolean;
   winningOutcome: string | null;
+  winningTokenId: string | null;
 } | null> {
   try {
     const url = `https://clob.polymarket.com/markets/${conditionId}`;
@@ -158,23 +159,24 @@ export async function getMarketResolution(conditionId: string): Promise<{
 
     const data = await response.json() as {
       condition_id: string;
-      tokens: Array<{ outcome: string; winner: boolean }>;
+      tokens: Array<{ token_id: string; outcome: string; winner: boolean }>;
       archived?: boolean;
     };
 
-    // Find the winning outcome - Polymarket marks winner BEFORE archiving
-				const winner = data.tokens?.find((t) => t.winner === true);
+    // Find the winning token - Polymarket marks winner BEFORE archiving
+    const winner = data.tokens?.find((t) => t.winner === true);
 
-				// Market is resolved if archived OR if any token is marked as winner
-				const isResolved = data.archived === true || !!winner;
+    // Market is resolved if archived OR if any token is marked as winner
+    const isResolved = data.archived === true || !!winner;
 
     if (!isResolved) {
-      return { resolved: false, winningOutcome: null };
+      return { resolved: false, winningOutcome: null, winningTokenId: null };
     }
 
     return {
       resolved: true,
       winningOutcome: winner?.outcome || null,
+      winningTokenId: winner?.token_id || null,
     };
   } catch (error) {
     logger.debug(`Failed to check resolution for ${conditionId}`);

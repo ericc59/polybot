@@ -1029,8 +1029,8 @@ export async function redeemResolvedPositions(): Promise<{
           continue;
         }
 
-        // Determine if this position won
-        const won = pos.outcome?.toLowerCase() === resolution.winningOutcome?.toLowerCase();
+        // Determine if this position won - match by token_id for reliability
+        const won = pos.tokenId === resolution.winningTokenId;
         const redemptionValue = won ? pos.size : 0; // $1 per share for winners, $0 for losers
 
         // Redeem the position

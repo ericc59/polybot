@@ -7,6 +7,56 @@ import * as detector from "./walkover-detector.service";
 import * as marketFinder from "./market-finder.service";
 import * as trading from "./trading.service";
 import * as telegram from "../telegram";
+import { spawn } from "child_process";
+
+/**
+ * Play system alert sound and show macOS notification for walkover
+ * Non-blocking and crash-safe - will never prevent walkover from triggering
+ */
+function playWalkoverAlert(player1: string, player2: string): void {
+  // Run everything async and detached so it can't block or crash the main flow
+  setImmediate(() => {
+    try {
+      // Play alert sound (multiple times for urgency)
+      const sounds = [
+        "/System/Library/Sounds/Glass.aiff",
+        "/System/Library/Sounds/Ping.aiff",
+        "/System/Library/Sounds/Glass.aiff",
+      ];
+
+      sounds.forEach((sound, i) => {
+        setTimeout(() => {
+          try {
+            const proc = spawn("afplay", [sound], { detached: true, stdio: "ignore" });
+            proc.unref(); // Don't wait for process
+          } catch { /* ignore */ }
+        }, i * 500);
+      });
+
+      // Show macOS notification
+      try {
+        const title = "🚨 WALKOVER DETECTED";
+        const message = `${player1} vs ${player2}`;
+        const proc = spawn("osascript", [
+          "-e",
+          `display notification "${message}" with title "${title}" sound name "Glass"`,
+        ], { detached: true, stdio: "ignore" });
+        proc.unref();
+      } catch { /* ignore */ }
+
+      // Text-to-speech alert
+      try {
+        const proc = spawn("say", ["-v", "Samantha", "Walkover detected. Check terminal now."],
+          { detached: true, stdio: "ignore" });
+        proc.unref();
+      } catch { /* ignore */ }
+
+    } catch (error) {
+      // Silently fail - alert is nice-to-have, not critical
+      logger.debug("Failed to play system alert");
+    }
+  });
+}
 
 // Module state
 let isRunning = false;
@@ -247,6 +297,13 @@ async function handleWalkoverDetected(
   logger.success(
     `WALKOVER DETECTED: ${match.player1} vs ${match.player2} (${detection.reason}, ${detection.confidence})`
   );
+
+  // Play system alert sound and notification (fire-and-forget, crash-safe)
+  try {
+    playWalkoverAlert(match.player1, match.player2);
+  } catch {
+    // Silently ignore - alert is non-critical
+  }
 
   // Build detection context
   const now = Date.now();

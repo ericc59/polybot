@@ -74,4 +74,81 @@ export const logger = {
       `${colors.debug}[${timestamp()}]${colors.reset} ${symbol} ${outcome}: ${color}${sign}${edgePct}%${colors.reset}`
     );
   },
+
+  // Display edges sorted by game time
+  edgesSorted: (edges: Array<{
+    outcome: string;
+    edge: number;
+    minEdge: number;
+    commenceTime: string;
+    homeTeam: string;
+    awayTeam: string;
+  }>) => {
+    if (edges.length === 0) return;
+
+    const now = Date.now();
+
+    // Sort by commence time (soonest first)
+    const sorted = [...edges].sort((a, b) => {
+      const timeA = new Date(a.commenceTime).getTime();
+      const timeB = new Date(b.commenceTime).getTime();
+      return timeA - timeB;
+    });
+
+    console.log(`${colors.debug}[${timestamp()}]${colors.reset} --- Edge Report (${sorted.length} outcomes) ---`);
+
+    for (const e of sorted) {
+      const edgePct = (e.edge * 100).toFixed(2);
+      const isValue = e.edge >= e.minEdge;
+      const isPositive = e.edge > 0;
+
+      let color: string;
+      let symbol: string;
+
+      if (isValue) {
+        color = colors.success;
+        symbol = "✓";
+      } else if (isPositive) {
+        color = colors.warn;
+        symbol = "○";
+      } else {
+        color = colors.error;
+        symbol = "✗";
+      }
+
+      const sign = e.edge >= 0 ? "+" : "";
+
+      // Calculate time until/since start
+      const commenceMs = new Date(e.commenceTime).getTime();
+      const diffMs = commenceMs - now;
+      const diffMins = Math.abs(diffMs) / 60000;
+
+      let timeStr: string;
+      if (diffMs > 0) {
+        // Game hasn't started
+        if (diffMins >= 60) {
+          const hours = Math.floor(diffMins / 60);
+          const mins = Math.round(diffMins % 60);
+          timeStr = `${colors.info}in ${hours}h${mins}m${colors.reset}`;
+        } else {
+          timeStr = `${colors.warn}in ${Math.round(diffMins)}m${colors.reset}`;
+        }
+      } else {
+        // Game started
+        if (diffMins >= 60) {
+          const hours = Math.floor(diffMins / 60);
+          const mins = Math.round(diffMins % 60);
+          timeStr = `${colors.success}LIVE ${hours}h${mins}m${colors.reset}`;
+        } else {
+          timeStr = `${colors.success}LIVE ${Math.round(diffMins)}m${colors.reset}`;
+        }
+      }
+
+      const gameLabel = `${e.homeTeam} vs ${e.awayTeam}`.substring(0, 35).padEnd(35);
+      console.log(
+        `${colors.debug}[${timestamp()}]${colors.reset} ${symbol} ${timeStr.padEnd(20)} ${gameLabel} ${e.outcome.padEnd(25)} ${color}${sign}${edgePct}%${colors.reset}`
+      );
+    }
+    console.log(`${colors.debug}[${timestamp()}]${colors.reset} --- End Edge Report ---`);
+  },
 };

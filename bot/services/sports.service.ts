@@ -1109,11 +1109,22 @@ function calculateDynamicMinEdge(
  * Find value bets for a single Polymarket event
  * Used for per-market processing flow
  */
+// Type for edge data collection
+type EdgeDataEntry = {
+	outcome: string;
+	edge: number;
+	minEdge: number;
+	commenceTime: string;
+	homeTeam: string;
+	awayTeam: string;
+};
+
 async function findValueBetsForEvent(
 	polyEvent: PolymarketSportsEvent,
 	oddsMatches: OddsApiMatch[],
 	config: SportsConfig,
 	debug: boolean = false,
+	edgeDataCollector?: EdgeDataEntry[],
 ): Promise<ValueBet[]> {
 	const valueBets: ValueBet[] = [];
 
@@ -1250,8 +1261,17 @@ async function findValueBetsForEvent(
 				config
 			);
 
-			// Log edge with color coding
-			if (debug) {
+			// Collect edge data for sorted display (or log inline if no collector)
+			if (edgeDataCollector) {
+				edgeDataCollector.push({
+					outcome: outcomeName,
+					edge,
+					minEdge: dynamicMinEdge,
+					commenceTime: oddsMatch.commence_time,
+					homeTeam: oddsMatch.home_team,
+					awayTeam: oddsMatch.away_team,
+				});
+			} else if (debug) {
 				logger.edge(outcomeName, edge, dynamicMinEdge);
 			}
 
@@ -1313,6 +1333,16 @@ export async function findValueBets(
   let matchedCount = 0;
   let noOddsCount = 0;
   let noMarketCount = 0;
+
+  // Collect edge data for sorted display
+  const edgeData: Array<{
+    outcome: string;
+    edge: number;
+    minEdge: number;
+    commenceTime: string;
+    homeTeam: string;
+    awayTeam: string;
+  }> = [];
 
   // START FROM POLYMARKET (source of truth)
   for (const polyEvent of polyEvents) {
@@ -1482,10 +1512,15 @@ export async function findValueBets(
 							config
 						);
 
-						// Simplified logging: just show outcome and edge with color coding
-						if (debug) {
-							logger.edge(outcomeName, edge, dynamicMinEdge);
-						}
+						// Collect edge data for sorted display
+						edgeData.push({
+							outcome: outcomeName,
+							edge,
+							minEdge: dynamicMinEdge,
+							commenceTime: oddsMatch.commence_time,
+							homeTeam: oddsMatch.home_team,
+							awayTeam: oddsMatch.away_team,
+						});
 
 						if (edge >= dynamicMinEdge) {
 							// Skip extreme underdogs (below minPrice threshold)
@@ -1531,6 +1566,11 @@ export async function findValueBets(
 				} catch (e) {
 					// Invalid JSON, skip
 				}
+  }
+
+  // Display edges sorted by game time
+  if (debug && edgeData.length > 0) {
+    logger.edgesSorted(edgeData);
   }
 
   // Log summary
@@ -1622,6 +1662,9 @@ async function pollForValueBets(userId: number, config: SportsConfig, debug: boo
 				let sellsExecuted = 0;
 				currentValueBets = [];
 
+				// Collect edge data for sorted display
+				const edgeDataCollector: EdgeDataEntry[] = [];
+
 				// Process each market individually: check value → bet → check sells
 				for (const polyEvent of polyEvents) {
 					// Find value bet for this specific event
@@ -1630,6 +1673,7 @@ async function pollForValueBets(userId: number, config: SportsConfig, debug: boo
 						oddsMatches,
 						config,
 						debug,
+						edgeDataCollector,
 					);
 
 					if (eventValueBets.length > 0) {
@@ -1683,6 +1727,11 @@ async function pollForValueBets(userId: number, config: SportsConfig, debug: boo
 				// 	const trimmed = await trimOverExposedPosition(userId, bet, config);
 				// 	if (trimmed) sellsExecuted++;
 				// }
+
+				// Display edges sorted by game time
+				if (debug && edgeDataCollector.length > 0) {
+					logger.edgesSorted(edgeDataCollector);
+				}
 
     // Convert poly events to tracked events for dashboard
 				currentTrackedEvents = polyEvents.map((event) => {
@@ -1887,6 +1936,28 @@ async function executeValueBet(
       }
 
       shares = betSize / bet.polymarketPrice;
+    }
+
+    // Check position cost limit for arbitrage safety
+    // Allow betting both sides as long as total cost stays under $1.00 (guaranteed profit zone)
+    if (bet.polymarketConditionId) {
+      const costCheck = wouldExceedPositionCostLimit(userId, bet.polymarketConditionId, betSize);
+
+      if (costCheck.blocked) {
+        logger.warn(
+          `Position cost limit: ${bet.outcome} would bring total to $${costCheck.newTotalCost.toFixed(2)} ` +
+          `(current: $${costCheck.currentCost.toFixed(2)}, adding: $${betSize.toFixed(2)})`
+        );
+        return { success: false, error: `Position cost would exceed $1.00 (${costCheck.newTotalCost.toFixed(2)})` };
+      }
+
+      // Log arbitrage opportunity if betting the other side
+      if (costCheck.currentCost > 0 && costCheck.potentialProfit > 0) {
+        logger.info(
+          `Arbitrage building: ${bet.outcome} - total cost $${costCheck.newTotalCost.toFixed(2)} → ` +
+          `potential profit $${costCheck.potentialProfit.toFixed(2)} (${((costCheck.potentialProfit / costCheck.newTotalCost) * 100).toFixed(1)}%)`
+        );
+      }
     }
 
     // Place market order - amount is in USD for BUY orders
@@ -2294,6 +2365,69 @@ export function hasBetOnToken(userId: number, tokenId: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Get total position cost for a market (both sides combined)
+ * Returns the total cost basis across all outcomes in this condition_id
+ *
+ * For arbitrage: if total_cost < $1.00, guaranteed profit on resolution
+ * Example: YES at 35¢ + NO at 40¢ = 75¢ total → 25¢ guaranteed profit
+ */
+export function getMarketPositionCost(userId: number, conditionId: string): {
+  totalCost: number;
+  positions: Array<{ tokenId: string; shares: number; avgPrice: number; cost: number }>;
+} {
+  try {
+    const rows = db()
+      .prepare(`
+        SELECT token_id as tokenId,
+               SUM(shares) as totalShares,
+               SUM(size) as totalCost,
+               SUM(size) / NULLIF(SUM(shares), 0) as avgPrice
+        FROM sports_bets
+        WHERE user_id = ?
+          AND condition_id = ?
+          AND status IN ('placed', 'open')
+        GROUP BY token_id
+      `)
+      .all(userId, conditionId) as Array<{ tokenId: string; totalShares: number; totalCost: number; avgPrice: number }>;
+
+    const positions = rows.map(r => ({
+      tokenId: r.tokenId,
+      shares: r.totalShares || 0,
+      avgPrice: r.avgPrice || 0,
+      cost: r.totalCost || 0,
+    }));
+
+    const totalCost = positions.reduce((sum, p) => sum + p.cost, 0);
+
+    return { totalCost, positions };
+  } catch {
+    return { totalCost: 0, positions: [] };
+  }
+}
+
+/**
+ * Check if adding a new bet would exceed the $1.00 position cost limit
+ * Returns true if the bet should be blocked
+ */
+export function wouldExceedPositionCostLimit(
+  userId: number,
+  conditionId: string,
+  newBetCost: number,
+  maxPositionCost: number = 0.98 // Leave 2% buffer for fees
+): { blocked: boolean; currentCost: number; newTotalCost: number; potentialProfit: number } {
+  const { totalCost: currentCost } = getMarketPositionCost(userId, conditionId);
+  const newTotalCost = currentCost + newBetCost;
+  const potentialProfit = 1.0 - newTotalCost; // Guaranteed profit if both sides held
+
+  return {
+    blocked: newTotalCost > maxPositionCost,
+    currentCost,
+    newTotalCost,
+    potentialProfit,
+  };
 }
 
 export function getSportsBetHistory(userId: number, limit: number = 20): Array<{
@@ -3100,9 +3234,9 @@ export async function checkMarketResolutions(): Promise<{ checked: number; resol
       resolved += bets.length;
 
       for (const bet of bets) {
-        // Check if our outcome won
-        // The winning outcome from Polymarket should match our bet outcome
-        const betWon = resolution.winningOutcome?.toLowerCase() === bet.outcome.toLowerCase();
+        // Check if our token won - match by token_id for reliability
+        // (outcome names can differ between Odds API and Polymarket)
+        const betWon = resolution.winningTokenId === bet.tokenId;
 
         if (betWon) {
           // Won: shares pay out at $1 each
