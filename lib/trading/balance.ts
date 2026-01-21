@@ -152,6 +152,11 @@ export async function fetchPositions(walletAddress: string): Promise<PolymarketP
 
     const data = await response.json() as any[];
 
+    // Debug: log first position to see structure
+    if (data.length > 0) {
+      console.log("[DEBUG] First position from API:", JSON.stringify(data[0], null, 2).slice(0, 500));
+    }
+
     return data.map(p => ({
       asset: p.asset || p.tokenId || "",
       conditionId: p.conditionId || "",

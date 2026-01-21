@@ -304,15 +304,10 @@ async function handleHelp(chatId: string): Promise<void> {
 /paper golive - Switch all to real trading
 
 *Sports Betting:*
-/sports - Sports value betting help
-/sports status - View settings & current stats
-/sports enable <sport> - Enable (nba, nfl, etc.)
-/sports disable <sport> - Disable a sport
-/sports auto <on|off> - Toggle auto-betting
-/sports edge <percent> - Set min edge
-/sports maxbet <amount> - Set max bet
-/sports value - Show current value bets
-/sports history - Recent sports bets
+/sports - Status & rules
+/sports start - Start auto-betting
+/sports stop - Stop monitoring
+/sports help - All commands
 
 *Subscription:*
 /plan - View current plan & pricing
@@ -1853,6 +1848,14 @@ async function handleSports(
 				)
 				.join(", ") || "None";
 
+			const dynamicEdgeInfo = config.dynamicEdgeEnabled
+				? `${(config.minEdge4Books * 100).toFixed(1)}%-${(config.minEdge2Books * 100).toFixed(1)}% (dynamic)`
+				: `${(config.minEdge * 100).toFixed(1)}%`;
+
+			const sizingInfo = config.sharesPerBet > 0
+				? `${config.sharesPerBet} shares (scales to ${config.sharesPerBet * config.maxEdgeMultiplier} w/ edge)`
+				: `$${config.minBetUsd} - $${config.maxBetUsd}`;
+
 			await sendMessage(
 				chatId,
 				`🏀 *Sports Betting Status*\n\n` +
@@ -1861,18 +1864,21 @@ async function handleSports(
 				`*Exposure:*\n` +
 				`• Current: $${currentExposure.toFixed(0)} / $${maxExposure.toFixed(0)} (${(config.maxExposurePct * 100).toFixed(0)}% of bankroll)\n` +
 				`• Available: $${exposureAvailable.toFixed(0)}\n\n` +
-				`*Buy Settings:*\n` +
-				`• Min edge to buy: ${(config.minEdge * 100).toFixed(1)}%\n` +
-				`• Bet size: $${config.minBetUsd} - $${config.maxBetUsd}\n` +
-				`• Max per market: $${config.maxPerMarket}\n` +
-				`• Books required: ${config.booksRequired}+\n\n` +
-				`*Sell Settings:*\n` +
-				`• Min sell edge: ${(config.minSellEdge * 100).toFixed(0)}%\n` +
-				`• Max hold price: ${(config.maxHoldPrice * 100).toFixed(0)}¢\n\n` +
+				`*Entry Rules:*\n` +
+				`• Min edge: ${dynamicEdgeInfo}\n` +
+				`• Min price: ${(config.minPrice * 100).toFixed(0)}¢\n` +
+				`• Max per market: $${config.maxPerMarket} / ${config.maxSharesPerMarket} shares\n` +
+				`• Books required: ${config.booksRequired}+\n` +
+				`• Timing: ${config.preGameBufferMinutes > 0 ? `Skip 0-${config.preGameBufferMinutes}min before start, live OK` : "No timing restrictions"}\n` +
+				`• Sizing: ${sizingInfo}\n\n` +
+				`*Exit Rules:*\n` +
+				`• All exits DISABLED - hold to resolution\n` +
+				`• Positions close when market settles\n\n` +
 				`*Sports:* ${enabledSports}\n\n` +
 				`*Activity:*\n` +
 				`• Today's volume: $${status.todaysVolume.toFixed(0)}\n` +
-				`• Value bets found: ${status.valueBetsFound}\n` +
+				`• Today's P&L: ${status.todaysPnl >= 0 ? `+$${status.todaysPnl.toFixed(2)}` : `-$${Math.abs(status.todaysPnl).toFixed(2)}`}\n` +
+				`• Current scan: ${status.valueBetsFound} value bets\n` +
 				`• Last poll: ${status.lastPoll ? new Date(status.lastPoll).toLocaleTimeString() : "Never"}`,
 				{ parseMode: "Markdown" },
 			);
@@ -2066,6 +2072,60 @@ async function handleSports(
 			break;
 		}
 
+		case "maxmarket": {
+			const max = parseFloat(args[1] || "");
+			if (isNaN(max) || max < 1) {
+				await sendMessage(chatId, "Usage: /sports maxmarket <amount>\n\nExample: /sports maxmarket 50\n\nThis limits total exposure per outcome (e.g., max $50 on any single team)");
+				return;
+			}
+			sportsService.updateSportsConfig(user.id, { maxPerMarket: max });
+			await sendMessage(chatId, `✅ Max per market set to $${max}`);
+			break;
+		}
+
+		case "minprice": {
+			const price = parseFloat(args[1] || "");
+			if (isNaN(price) || price < 0 || price > 99) {
+				await sendMessage(chatId, "Usage: /sports minprice <cents>\n\nExample: /sports minprice 20\n\nThis prevents betting on outcomes priced below this threshold (e.g., 20 = 20¢ = no extreme underdogs).\n\nSet to 0 to disable.");
+				return;
+			}
+			// Convert cents to decimal (e.g., 25 -> 0.25)
+			const minPrice = price >= 1 ? price / 100 : price;
+			sportsService.updateSportsConfig(user.id, { minPrice });
+			if (minPrice === 0) {
+				await sendMessage(chatId, `✅ Min price disabled - will bet on any odds`);
+			} else {
+				await sendMessage(chatId, `✅ Min price set to ${(minPrice * 100).toFixed(0)}¢ - won't bet on outcomes below this`);
+			}
+			break;
+		}
+
+		case "shares": {
+			const shares = parseInt(args[1] || "", 10);
+			if (isNaN(shares) || shares < 0) {
+				await sendMessage(chatId, "Usage: /sports shares <amount>\n\nExample: /sports shares 25\n\nBuy fixed number of shares per bet (e.g., 25 shares).\n\nSet to 0 to use dollar-based sizing instead.");
+				return;
+			}
+			sportsService.updateSportsConfig(user.id, { sharesPerBet: shares });
+			if (shares === 0) {
+				await sendMessage(chatId, `✅ Share-based sizing disabled - using dollar amounts`);
+			} else {
+				await sendMessage(chatId, `✅ Shares per bet set to ${shares}`);
+			}
+			break;
+		}
+
+		case "maxshares": {
+			const max = parseInt(args[1] || "", 10);
+			if (isNaN(max) || max < 1) {
+				await sendMessage(chatId, "Usage: /sports maxshares <amount>\n\nExample: /sports maxshares 100\n\nMax shares per outcome (e.g., max 100 shares on any single team)");
+				return;
+			}
+			sportsService.updateSportsConfig(user.id, { maxSharesPerMarket: max });
+			await sendMessage(chatId, `✅ Max shares per market set to ${max}`);
+			break;
+		}
+
 		case "maxperevent": {
 			const max = parseInt(args[1] || "", 10);
 			if (isNaN(max) || max < 1 || max > 50) {
@@ -2085,6 +2145,34 @@ async function handleSports(
 			}
 			sportsService.updateSportsConfig(user.id, { maxExposurePct: pct / 100 });
 			await sendMessage(chatId, `✅ Max exposure set to ${pct}% of bankroll`);
+			break;
+		}
+
+		case "minsellprofit": {
+			const pct = parseInt(args[1] || "", 10);
+			if (isNaN(pct) || pct < 0 || pct > 100) {
+				await sendMessage(chatId, "Usage: /sports minsellprofit <percent>\n\nExample: /sports minsellprofit 10\n\nOnly sell positions when profit is at least this % (default: 5%)");
+				return;
+			}
+			sportsService.updateSportsConfig(user.id, { minSellProfit: pct / 100 });
+			await sendMessage(chatId, `✅ Min sell profit set to ${pct}%`);
+			break;
+		}
+
+		case "dynamic": {
+			const toggle = args[1]?.toLowerCase();
+			if (toggle === "on") {
+				sportsService.updateSportsConfig(user.id, { dynamicEdgeEnabled: true });
+				await sendMessage(chatId, "✅ Dynamic edge enabled - uses 2.5%-5% based on book consensus");
+			} else if (toggle === "off") {
+				sportsService.updateSportsConfig(user.id, { dynamicEdgeEnabled: false });
+				const config = sportsService.getSportsConfig(user.id);
+				await sendMessage(chatId, `✅ Dynamic edge disabled - using fixed ${(config.minEdge * 100).toFixed(1)}% threshold`);
+			} else {
+				const config = sportsService.getSportsConfig(user.id);
+				const status = config.dynamicEdgeEnabled ? "ON (2.5%-5%)" : `OFF (${(config.minEdge * 100).toFixed(1)}%)`;
+				await sendMessage(chatId, `Dynamic edge: *${status}*\n\nUsage: /sports dynamic <on|off>`, { parseMode: "Markdown" });
+			}
 			break;
 		}
 
@@ -2148,26 +2236,44 @@ async function handleSports(
 			break;
 		}
 
+		case "reset": {
+			const result = sportsService.resetSportsBets(user.id);
+			await sendMessage(
+				chatId,
+				`✅ *Sports Bets Reset*\n\n` +
+				`Deleted ${result.deleted} bets from database.\n\n` +
+				`⚠️ Note: This only clears the database tracking. Any open positions on Polymarket remain - you'll need to sell them manually if desired.`,
+				{ parseMode: "Markdown" },
+			);
+			break;
+		}
+
 		case "help": {
 			await sendMessage(
 				chatId,
 				`🏀 *Sports Value Betting*\n\n` +
 				`Find and bet on Polymarket sports markets where the price is below sharp bookmaker lines.\n\n` +
 				`*Commands:*\n` +
-				`/sports - Show status & settings\n` +
-				`/sports scan - One-time scan for value bets\n` +
-				`/sports start - Start auto-betting monitor\n` +
+				`/sports - Show status & rules\n\n` +
+				`*Monitor:*\n` +
+				`/sports start - Start auto-betting\n` +
 				`/sports stop - Stop monitoring\n` +
-				`/sports auto <on|off> - Toggle auto-betting\n` +
-				`/sports enable <sport> - Enable sport (nba, ncaab, nfl)\n` +
-				`/sports disable <sport> - Disable a sport\n` +
-				`/sports edge <percent> - Set min edge (e.g., 5)\n` +
-				`/sports maxbet <amount> - Set max bet size\n` +
-				`/sports maxperevent <count> - Max bets per event\n` +
-				`/sports value - Show current value bets\n` +
-				`/sports history - Show betting history\n` +
-				`/sports sync - Sync DB with Polymarket positions\n` +
-				`/sports exposure <pct> - Set max exposure (% of bankroll)`,
+				`/sports auto <on|off> - Toggle auto-trade\n` +
+				`/sports scan - One-time scan\n\n` +
+				`*Entry Settings:*\n` +
+				`/sports edge <pct> - Min edge (e.g., 4.2)\n` +
+				`/sports minprice <cents> - Min price (e.g., 20)\n` +
+				`/sports maxmarket <$> - Max $ per outcome\n` +
+				`/sports maxshares <n> - Max shares per outcome\n` +
+				`/sports shares <n> - Shares per bet\n` +
+				`/sports exposure <pct> - Max bankroll %\n\n` +
+				`*Sports:*\n` +
+				`/sports enable <sport> - Enable (nba, ncaab, nfl, nhl)\n` +
+				`/sports disable <sport> - Disable\n\n` +
+				`*View:*\n` +
+				`/sports value - Current value bets\n` +
+				`/sports history - Betting history\n` +
+				`/sports sync - Sync with Polymarket`,
 				{ parseMode: "Markdown" },
 			);
 			break;
@@ -2221,6 +2327,14 @@ async function handleSports(
 					)
 					.join(", ") || "None";
 
+				const dynamicEdgeInfo = cfg.dynamicEdgeEnabled
+					? `${(cfg.minEdge4Books * 100).toFixed(1)}%-${(cfg.minEdge2Books * 100).toFixed(1)}% (dynamic)`
+					: `${(cfg.minEdge * 100).toFixed(1)}%`;
+
+				const sizingInfo = cfg.sharesPerBet > 0
+					? `${cfg.sharesPerBet} shares (scales to ${cfg.sharesPerBet * cfg.maxEdgeMultiplier} w/ edge)`
+					: `$${cfg.minBetUsd} - $${cfg.maxBetUsd}`;
+
 				await sendMessage(
 					chatId,
 					`🏀 *Sports Betting Status*\n\n` +
@@ -2229,18 +2343,21 @@ async function handleSports(
 					`*Exposure:*\n` +
 					`• Current: $${currentExposure.toFixed(0)} / $${maxExposure.toFixed(0)} (${(cfg.maxExposurePct * 100).toFixed(0)}% of bankroll)\n` +
 					`• Available: $${exposureAvailable.toFixed(0)}\n\n` +
-					`*Buy Settings:*\n` +
-					`• Min edge: ${(cfg.minEdge * 100).toFixed(1)}%\n` +
-					`• Bet size: $${cfg.minBetUsd} - $${cfg.maxBetUsd}\n` +
-					`• Max per market: $${cfg.maxPerMarket}\n` +
-					`• Books required: ${cfg.booksRequired}+\n\n` +
-					`*Sell Settings:*\n` +
-					`• Min sell edge: ${(cfg.minSellEdge * 100).toFixed(0)}%\n` +
-					`• Max hold price: ${(cfg.maxHoldPrice * 100).toFixed(0)}¢\n\n` +
+					`*Entry Rules:*\n` +
+					`• Min edge: ${dynamicEdgeInfo}\n` +
+					`• Min price: ${(cfg.minPrice * 100).toFixed(0)}¢\n` +
+					`• Max per market: $${cfg.maxPerMarket} / ${cfg.maxSharesPerMarket} shares\n` +
+					`• Books required: ${cfg.booksRequired}+\n` +
+					`• Timing: ${cfg.preGameBufferMinutes > 0 ? `Skip 0-${cfg.preGameBufferMinutes}min before start, live OK` : "No timing restrictions"}\n` +
+					`• Sizing: ${sizingInfo}\n\n` +
+					`*Exit Rules:*\n` +
+					`• All exits DISABLED - hold to resolution\n` +
+					`• Positions close when market settles\n\n` +
 					`*Sports:* ${enabledSports}\n\n` +
 					`*Activity:*\n` +
 					`• Today's volume: $${status.todaysVolume.toFixed(0)}\n` +
-					`• Value bets found: ${status.valueBetsFound}\n` +
+					`• Today's P&L: ${status.todaysPnl >= 0 ? `+$${status.todaysPnl.toFixed(2)}` : `-$${Math.abs(status.todaysPnl).toFixed(2)}`}\n` +
+					`• Current scan: ${status.valueBetsFound} value bets\n` +
 					`• Last poll: ${status.lastPoll ? new Date(status.lastPoll).toLocaleTimeString() : "Never"}\n\n` +
 					`_Use /sports help for commands_`,
 					{ parseMode: "Markdown" },
@@ -2250,21 +2367,27 @@ async function handleSports(
 				await sendMessage(
 					chatId,
 					`🏀 *Sports Value Betting*\n\n` +
-					`Find and bet on Polymarket sports markets where the price is below sharp bookmaker lines.\n\n` +
+					`Bets on Polymarket sports when price < sharp bookmaker EV.\n\n` +
 					`*Commands:*\n` +
-					`/sports - Show status & settings\n` +
-					`/sports scan - One-time scan for value bets\n` +
-					`/sports start - Start auto-betting monitor\n` +
+					`/sports - Show status & rules\n\n` +
+					`*Monitor:*\n` +
+					`/sports start - Start auto-betting\n` +
 					`/sports stop - Stop monitoring\n` +
-					`/sports auto <on|off> - Toggle auto-betting\n` +
-					`/sports enable <sport> - Enable sport (nba, ncaab, nfl)\n` +
-					`/sports disable <sport> - Disable a sport\n` +
-					`/sports edge <percent> - Set min edge (e.g., 5)\n` +
-					`/sports maxbet <amount> - Set max bet size\n` +
-					`/sports maxperevent <count> - Max bets per event\n` +
-					`/sports value - Show current value bets\n` +
-					`/sports history - Show betting history\n` +
-					`/sports help - Show this message`,
+					`/sports auto <on|off> - Toggle auto-trade\n\n` +
+					`*Entry Settings:*\n` +
+					`/sports edge <pct> - Min edge threshold\n` +
+					`/sports dynamic <on|off> - Dynamic edge (2.5-5%)\n` +
+					`/sports minprice <cents> - Min price\n` +
+					`/sports maxmarket <$> - Max $ per outcome\n` +
+					`/sports shares <n> - Shares per bet\n` +
+					`/sports maxshares <n> - Max shares per outcome\n` +
+					`/sports maxperevent <n> - Max bets per event\n` +
+					`/sports exposure <pct> - Max % bankroll exposed\n\n` +
+					`*Sports:*\n` +
+					`/sports enable/disable <sport>\n\n` +
+					`*View:*\n` +
+					`/sports value - Current opportunities\n` +
+					`/sports history - Bet history`,
 					{ parseMode: "Markdown" },
 				);
 			}

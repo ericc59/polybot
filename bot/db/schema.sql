@@ -191,6 +191,9 @@ ALTER TABLE user_trading_wallets ADD COLUMN proxy_address TEXT;
 -- Migration v3: Add max per market limit
 ALTER TABLE user_trading_wallets ADD COLUMN max_per_market REAL;
 
+-- Migration v4: Add shares per trade for copy trading
+ALTER TABLE user_trading_wallets ADD COLUMN shares_per_trade INTEGER;
+
 -- =============================================
 -- USER IGNORED MARKETS (per-user market filtering)
 -- =============================================

@@ -242,3 +242,47 @@ Both orders at $0.49 → settle at $0.50`.trim();
 
   await broadcastToAdmins(message);
 }
+
+/**
+ * Post walkover detection to the public channel (like sports bets and copy trades)
+ */
+export async function postWalkoverToChannel(
+  player1: string,
+  player2: string,
+  reason: string,
+  confidence: string,
+  ordersPlaced: boolean
+): Promise<void> {
+  const channelId = process.env.TELEGRAM_CHAT_ID;
+  if (!channelId) return;
+
+  try {
+    // Format the reason in a human-readable way
+    let reasonText = reason;
+    if (reason === "disappeared_before_start") {
+      reasonText = "Match disappeared from API";
+    } else if (reason === "completed_no_scores") {
+      reasonText = "Completed with no scores";
+    } else if (reason === "manual") {
+      reasonText = "Manual trigger";
+    }
+
+    const statusEmoji = ordersPlaced ? "✅" : "⚠️";
+    const statusText = ordersPlaced ? "Orders placed" : "Pending verification";
+
+    const message = [
+      `🎾 *Tennis Walkover Detected* 🚨`,
+      ``,
+      `*${player1} vs ${player2}*`,
+      ``,
+      `📋 Trigger: ${reasonText}`,
+      `🎯 Confidence: *${confidence.toUpperCase()}*`,
+      `${statusEmoji} Status: ${statusText}`,
+    ].join("\n");
+
+    await mainBotSendMessage(channelId, message, { parseMode: "Markdown" });
+    logger.debug(`Posted walkover to channel: ${player1} vs ${player2}`);
+  } catch (error) {
+    logger.error("Failed to post walkover to channel", error);
+  }
+}

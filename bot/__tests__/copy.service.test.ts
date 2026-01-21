@@ -168,7 +168,7 @@ describe("copy.service", () => {
 
         const wallet = copyService.getTradingWallet(TEST_USER_ID);
         expect(wallet?.copyEnabled).toBe(0); // Default disabled
-        expect(wallet?.copyPercentage).toBe(100); // Default 100%
+        expect(wallet?.copyPercentage).toBe(10); // Default 10%
       });
     });
 
@@ -360,7 +360,7 @@ describe("copy.service", () => {
       });
 
       test("should sum only executed trades", () => {
-        // Executed trade: 100 shares * 0.5 = $50
+        // Executed trade: $50 (must have txHash to count)
         copyService.logCopyTrade({
           userId: TEST_USER_ID,
           sourceWallet: "0xwhale",
@@ -368,11 +368,11 @@ describe("copy.service", () => {
           marketConditionId: "cond-1",
           marketTitle: "Market 1",
           side: "BUY",
-          size: 100,
+          size: 50,
           price: 0.5,
           status: "executed",
-          orderId: null,
-          txHash: null,
+          orderId: "order-123",
+          txHash: "0xtxhash123", // Must have txHash to be counted
           errorMessage: null,
         });
 

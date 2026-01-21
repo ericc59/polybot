@@ -85,6 +85,7 @@ export interface TradingWallet {
   dailyLimit: number | null;
   maxPerMarket: number | null;  // Max total exposure per market/event
   proxyAddress: string | null;  // Polymarket proxy wallet address
+  sharesPerTrade: number | null;  // Fixed shares per trade (overrides dollar-based sizing)
 }
 
 export interface CopyTradeRecord {
@@ -188,7 +189,8 @@ export function getTradingWallet(userId: number): TradingWallet | null {
       encrypted_credentials as encryptedCredentials,
       copy_enabled as copyEnabled, copy_percentage as copyPercentage,
       max_trade_size as maxTradeSize, daily_limit as dailyLimit,
-      max_per_market as maxPerMarket, proxy_address as proxyAddress
+      max_per_market as maxPerMarket, proxy_address as proxyAddress,
+      shares_per_trade as sharesPerTrade
     FROM user_trading_wallets
     WHERE user_id = ?
   `);
@@ -678,27 +680,29 @@ async function executeCopyTrade(
     return { success: false, error: "Insufficient balance" };
   }
 
-  // Smart copy sizing:
-		// - If whale trade is under max trade size, match it exactly (1:1)
-		// - If whale trade exceeds max trade size, cap at max trade size
-		// - Fallback to % of balance if no max trade size is set
-		let copySize: number;
+  // Copy sizing logic
+  let copySize: number;
+  const currentPrice = parseFloat(trade.price);
 
-  if (tradingWallet.maxTradeSize) {
-			if (sourceTradeSize <= tradingWallet.maxTradeSize) {
-				// Match the whale's bet exactly
-				copySize = sourceTradeSize;
-			} else {
-				// Whale bet exceeds our max, use our max
-				copySize = tradingWallet.maxTradeSize;
-			}
-		} else {
-			// No max trade size set - use percentage-based sizing
-			const maxAffordable = userBalance * (tradingWallet.copyPercentage / 100);
-			copySize = Math.min(sourceTradeSize, maxAffordable);
-		}
+  // Share-based sizing (if sharesPerTrade is set)
+  if (tradingWallet.sharesPerTrade && tradingWallet.sharesPerTrade > 0) {
+    // Fixed shares per trade - calculate USD amount
+    copySize = tradingWallet.sharesPerTrade * currentPrice;
+    logger.debug(`Copy sizing: ${tradingWallet.sharesPerTrade} shares @ ${(currentPrice * 100).toFixed(0)}¢ = $${copySize.toFixed(2)}`);
+  } else if (tradingWallet.maxTradeSize) {
+    // Dollar-based sizing with max trade size
+    if (sourceTradeSize <= tradingWallet.maxTradeSize) {
+      copySize = sourceTradeSize;
+    } else {
+      copySize = tradingWallet.maxTradeSize;
+    }
+  } else {
+    // Percentage-based sizing (fallback)
+    const maxAffordable = userBalance * (tradingWallet.copyPercentage / 100);
+    copySize = Math.min(sourceTradeSize, maxAffordable);
+  }
 
-  // Also cap at user's available balance
+  // Cap at user's available balance
   if (copySize > userBalance) {
     copySize = userBalance;
   }
@@ -709,8 +713,8 @@ async function executeCopyTrade(
   }
 
   logger.debug(
-			`Copy sizing: whale=$${sourceTradeSize.toFixed(0)}, you=$${copySize.toFixed(2)} (balance=$${userBalance.toFixed(0)}, maxTradeSize=$${tradingWallet.maxTradeSize || "none"})`,
-		);
+    `Copy sizing: whale=$${sourceTradeSize.toFixed(0)}, you=$${copySize.toFixed(2)} (balance=$${userBalance.toFixed(0)}, sharesPerTrade=${tradingWallet.sharesPerTrade || "none"})`,
+  );
 
   // Check daily limit
   if (tradingWallet.dailyLimit) {

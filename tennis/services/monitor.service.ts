@@ -295,6 +295,9 @@ async function handleWalkoverDetected(
     }
   );
 
+  // Track whether orders were placed for channel notification
+  let ordersPlaced = false;
+
   // For manual triggers, also place orders
   if (detection.reason === "manual") {
     // Check if we have Polymarket market info
@@ -316,6 +319,14 @@ async function handleWalkoverDetected(
           `🎾 ${match.player1} vs ${match.player2}\n\n` +
           `Please link market manually.`
         );
+        // Still post to channel even if orders couldn't be placed
+        await telegram.postWalkoverToChannel(
+          match.player1,
+          match.player2,
+          detection.reason || "unknown",
+          detection.confidence || "unknown",
+          false
+        );
         return;
       }
     }
@@ -326,6 +337,7 @@ async function handleWalkoverDetected(
 
       if (result.success) {
         logger.success(`Orders placed successfully for ${match.player1} vs ${match.player2}`);
+        ordersPlaced = true;
         await telegram.sendOrderPlacedNotification(
           match.player1,
           match.player2,
@@ -356,6 +368,15 @@ async function handleWalkoverDetected(
       `ℹ️ Use <code>/detect ${match.id}</code> to place orders if this is a real walkover.`
     );
   }
+
+  // Post to public channel (like sports bets and copy trades)
+  await telegram.postWalkoverToChannel(
+    match.player1,
+    match.player2,
+    detection.reason || "unknown",
+    detection.confidence || "unknown",
+    ordersPlaced
+  );
 }
 
 /**
