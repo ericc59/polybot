@@ -5,7 +5,6 @@ import { analyzeWallet } from "../tracker/analyzer";
 import * as consoleUI from "../utils/console-ui";
 import { logger } from "../utils/logger";
 import { dispatchAlerts, generateTradeHash } from "./alert.service";
-import * as paperService from "./paper.service";
 import * as priceService from "./price.service";
 
 // Track watched wallet addresses (refreshed periodically)

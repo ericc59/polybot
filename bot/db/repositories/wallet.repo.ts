@@ -160,26 +160,7 @@ export async function getAllTrackedWalletAddresses(): Promise<string[]> {
     WHERE notify_enabled = 1
   `).all() as { wallet_address: string }[];
 
-  // Also get wallets from paper trading portfolios
-  let paperWallets: { wallet_address: string }[] = [];
-  try {
-    paperWallets = db.query(`
-      SELECT DISTINCT ppw.wallet_address
-      FROM paper_portfolio_wallets ppw
-      JOIN paper_portfolios pp ON ppw.portfolio_id = pp.id
-      WHERE pp.is_active = 1
-    `).all() as { wallet_address: string }[];
-  } catch {
-    // Table may not exist yet, ignore
-  }
-
-  // Combine and deduplicate
-  const allAddresses = new Set([
-    ...regularWallets.map((r) => r.wallet_address),
-    ...paperWallets.map((r) => r.wallet_address),
-  ]);
-
-  return Array.from(allAddresses);
+  return regularWallets.map((r) => r.wallet_address);
 }
 
 // Update wallet stats for a user's subscription

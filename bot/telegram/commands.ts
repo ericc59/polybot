@@ -3,7 +3,6 @@ import * as userRepo from "../db/repositories/user.repo";
 import * as walletRepo from "../db/repositories/wallet.repo";
 import * as adminService from "../services/admin.service";
 import * as copyService from "../services/copy.service";
-import * as paperService from "../services/paper.service";
 import * as stripeService from "../services/stripe.service";
 import * as tradingService from "../services/trading.service";
 import * as sportsService from "../services/sports.service";
@@ -138,9 +137,6 @@ export async function handleCommand(message: TelegramMessage): Promise<void> {
 			break;
 		case "admin":
 			await handleAdmin(user, chatId, args);
-			break;
-		case "paper":
-			await handlePaper(user, chatId, args);
 			break;
 		case "positions":
 			await handlePositions(user, chatId);
@@ -291,17 +287,6 @@ async function handleHelp(chatId: string): Promise<void> {
 /ignore <pattern> - Ignore markets matching pattern
 /unignore <pattern> - Remove from ignore list
 /ignored - View ignored patterns
-
-*Paper Trading:*
-/paper start [amount] - Start with virtual $amount
-/paper add <wallet> - Add wallet to track
-/paper remove <wallet> - Remove wallet
-/paper wallets - List tracked wallets
-/paper status - View portfolio
-/paper history - Trade history
-/paper reset [amount] - Clear positions, reset balance
-/paper stop - Stop and see results
-/paper golive - Switch all to real trading
 
 *Sports Betting:*
 /sports - Status & rules
@@ -2555,235 +2540,6 @@ async function handleBilling(
 	} catch (error: any) {
 		logger.error("Failed to create billing portal", error);
 		await sendMessage(chatId, `Error: ${error.message}`);
-	}
-}
-
-// =============================================
-// PAPER TRADING COMMANDS
-// =============================================
-
-async function handlePaper(
-	user: userRepo.UserWithSettings,
-	chatId: string,
-	args: string[],
-): Promise<void> {
-	const subcommand = args[0]?.toLowerCase();
-
-	switch (subcommand) {
-		case "start": {
-			const amount = parseFloat(args[1] || "10000");
-
-			if (isNaN(amount) || amount < 100) {
-				await sendMessage(
-					chatId,
-					"Amount must be at least $100\n\nUsage: /paper start [amount]",
-				);
-				return;
-			}
-
-			const result = paperService.startPaperTrading(user.id, amount);
-			if (result.success) {
-				await sendMessage(
-					chatId,
-					`*Paper Trading Started!*\n\nStarting balance: $${amount.toFixed(2)}\n\nNow add wallets to track:\n/paper add <wallet>\n\nExample: /paper add 0x123...`,
-					{ parseMode: "Markdown" },
-				);
-			} else {
-				await sendMessage(chatId, `Failed: ${result.error}`);
-			}
-			break;
-		}
-
-		case "add": {
-			const wallet = args[1]?.toLowerCase();
-			if (!wallet || !isValidAddress(wallet)) {
-				await sendMessage(
-					chatId,
-					"Usage: /paper add <wallet>\n\nExample: /paper add 0x123...",
-				);
-				return;
-			}
-
-			const result = paperService.addWalletToPortfolio(user.id, wallet);
-			if (result.success) {
-				const trackedWallets = paperService.getTrackedWallets(user.id);
-				await sendMessage(
-					chatId,
-					`*Wallet Added!*\n\nNow tracking: \`${wallet.slice(0, 10)}...${wallet.slice(-6)}\`\n\nTotal wallets: ${trackedWallets.length}\n\nTrades from this wallet will be simulated in your paper portfolio.`,
-					{ parseMode: "Markdown" },
-				);
-			} else {
-				await sendMessage(chatId, `Failed: ${result.error}`);
-			}
-			break;
-		}
-
-		case "remove": {
-			const wallet = args[1]?.toLowerCase();
-			if (!wallet || !isValidAddress(wallet)) {
-				await sendMessage(chatId, "Usage: /paper remove <wallet>");
-				return;
-			}
-
-			const result = paperService.removeWalletFromPortfolio(user.id, wallet);
-			if (result.success) {
-				await sendMessage(
-					chatId,
-					`Removed \`${wallet.slice(0, 10)}...\` from paper portfolio.`,
-					{ parseMode: "Markdown" },
-				);
-			} else {
-				await sendMessage(chatId, `Failed: ${result.error}`);
-			}
-			break;
-		}
-
-		case "stop": {
-			const result = paperService.stopPaperTrading(user.id);
-			if (result.success && result.portfolio) {
-				const pnlSign = result.portfolio.pnl >= 0 ? "+" : "";
-				await sendMessage(
-					chatId,
-					`*Paper Trading Stopped*\n\nFinal Results:\nStarting: $${result.portfolio.startingBalance.toFixed(2)}\nEnding: $${result.portfolio.totalValue.toFixed(2)}\nP&L: ${pnlSign}$${result.portfolio.pnl.toFixed(2)} (${pnlSign}${result.portfolio.pnlPercent.toFixed(1)}%)\nTotal Trades: ${result.portfolio.trades}`,
-					{ parseMode: "Markdown" },
-				);
-			} else {
-				await sendMessage(chatId, "No active paper portfolio to stop.");
-			}
-			break;
-		}
-
-		case "reset": {
-			const amount = parseFloat(args[1] || "10000");
-			const result = paperService.resetPaperPortfolio(user.id, amount);
-			if (result.success) {
-				await sendMessage(
-					chatId,
-					`*Paper Portfolio Reset*\n\n` +
-					`All positions cleared.\n` +
-					`New balance: $${amount.toFixed(2)}\n\n` +
-					`Your tracked wallets are still active.`,
-					{ parseMode: "Markdown" },
-				);
-			} else {
-				await sendMessage(chatId, `Failed: ${result.error}`);
-			}
-			break;
-		}
-
-		case "status": {
-			const portfolio = paperService.getPaperPortfolio(user.id);
-			if (!portfolio) {
-				await sendMessage(
-					chatId,
-					"No active paper trading.\n\nStart with: /paper start [amount]",
-				);
-				return;
-			}
-
-			const summary = paperService.formatPortfolioSummary(portfolio);
-			await sendMessage(chatId, summary, { parseMode: "Markdown" });
-			break;
-		}
-
-		case "history": {
-			const trades = paperService.getPaperTradeHistory(user.id, 15);
-			if (trades.length === 0) {
-				await sendMessage(
-					chatId,
-					"No paper trades yet.\n\nAdd wallets to track with /paper add <wallet>",
-				);
-				return;
-			}
-
-			const lines = trades.map((t) => {
-				const title =
-					t.marketTitle.length > 20
-						? t.marketTitle.slice(0, 20) + "..."
-						: t.marketTitle;
-				const emoji = t.side === "BUY" ? "🟢" : "🔴";
-				const walletShort = t.sourceWallet.slice(0, 6) + "...";
-				return `${emoji} $${t.value.toFixed(0)} ${title}\n   _from ${walletShort}_`;
-			});
-
-			await sendMessage(
-				chatId,
-				`*Paper Trade History*\n\n${lines.join("\n\n")}`,
-				{ parseMode: "Markdown" },
-			);
-			break;
-		}
-
-		case "golive": {
-			const portfolio = paperService.getPaperPortfolio(user.id);
-			if (!portfolio || portfolio.wallets.length === 0) {
-				await sendMessage(
-					chatId,
-					"No active paper portfolio with tracked wallets.",
-				);
-				return;
-			}
-
-			// Check tier
-			if (!user.tier.can_use_copy_trading) {
-				await sendMessage(
-					chatId,
-					"Copy trading requires Pro or Enterprise subscription.\n\nUse /plan to upgrade.",
-				);
-				return;
-			}
-
-			// Check if trading wallet is connected
-			const tradingWallet = copyService.getTradingWallet(user.id);
-			if (!tradingWallet) {
-				await sendMessage(
-					chatId,
-					"Connect your trading wallet first with /connect",
-				);
-				return;
-			}
-
-			// Stop paper trading and start real copy trading for all tracked wallets
-			const wallets = portfolio.wallets;
-			paperService.stopPaperTrading(user.id);
-
-			for (const wallet of wallets) {
-				copyService.subscribeToCopy(user.id, wallet, "auto");
-			}
-
-			await sendMessage(
-				chatId,
-				`*Gone Live!*\n\nSwitched ${wallets.length} wallet(s) from paper to real copy trading.\n\nTrades will now be executed with real funds.`,
-				{ parseMode: "Markdown" },
-			);
-			break;
-		}
-
-		case "wallets": {
-			const wallets = paperService.getTrackedWallets(user.id);
-			if (wallets.length === 0) {
-				await sendMessage(
-					chatId,
-					"No wallets tracked in paper portfolio.\n\nAdd with: /paper add <wallet>",
-				);
-				return;
-			}
-
-			const lines = wallets.map((w, i) => `${i + 1}. \`${w}\``);
-			await sendMessage(
-				chatId,
-				`*Tracked Wallets (${wallets.length})*\n\n${lines.join("\n")}`,
-				{ parseMode: "Markdown" },
-			);
-			break;
-		}
-
-		default:
-			await sendMessage(
-				chatId,
-				`*Paper Trading*\n\nSimulate copy trading with virtual money.\n\n*Commands:*\n/paper start [amount] - Start with $amount (default: $10k)\n/paper add <wallet> - Add wallet to track\n/paper remove <wallet> - Remove wallet\n/paper wallets - List tracked wallets\n/paper status - View portfolio\n/paper history - View trade history\n/paper stop - Stop and see results\n/paper golive - Switch all wallets to real trading`,
-				{ parseMode: "Markdown" },
-			);
 	}
 }
 

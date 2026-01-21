@@ -2,7 +2,6 @@ import { sendMessage, createInlineKeyboard } from "../telegram/index";
 import * as walletRepo from "../db/repositories/wallet.repo";
 import * as alertRepo from "../db/repositories/alert.repo";
 import * as copyService from "./copy.service";
-import * as paperService from "./paper.service";
 import { config } from "../config";
 import { logger } from "../utils/logger";
 import type { Trade } from "../api/polymarket";
@@ -365,16 +364,6 @@ export async function dispatchAlerts(event: TradeEvent): Promise<number> {
 
   if (sent > 0) {
     logger.info(`Dispatched ${sent} alerts for trade ${tradeHash.slice(0, 16)}...`);
-  }
-
-  // Process paper trades for users simulating this wallet
-  try {
-    const paperStats = await paperService.processPaperTradesForWallet(event.walletAddress, event.trade);
-    if (paperStats.processed > 0 || paperStats.failed > 0) {
-      logger.info(`Paper trading: ${paperStats.processed} processed, ${paperStats.failed} failed`);
-    }
-  } catch (error) {
-    logger.error("Failed to process paper trades", error);
   }
 
   return sent;

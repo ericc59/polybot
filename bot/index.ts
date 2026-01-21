@@ -11,7 +11,6 @@ import {
 	stopRealtimeMonitor,
 } from "./services/realtime.service";
 import * as stripeService from "./services/stripe.service";
-import * as paperService from "./services/paper.service";
 import * as copyService from "./services/copy.service";
 import * as sportsService from "./services/sports.service";
 import {
@@ -48,9 +47,6 @@ async function main() {
 		case "analyze":
 			await runAnalyze(args[1]);
 			break;
-		case "paper":
-			await runPaperCommand(args[1], args[2]);
-			break;
 		case "setup":
 			runSetup();
 			break;
@@ -83,12 +79,6 @@ async function runStart() {
 
 	// Initialize sports betting schema
 	sportsService.initSportsSchema();
-
-	// Initialize paper trading and backfill missing data
-	await paperService.initAndBackfill();
-
-	// Start periodic redemption check for paper trading (every 5 minutes)
-	paperService.startRedemptionMonitor();
 
 	// Initialize real copy trading and check for redemptions
 	await copyService.initAndCheckRedemptions();
@@ -187,7 +177,6 @@ async function runStart() {
 	// Handle graceful shutdown
 	process.on("SIGINT", () => {
 		logger.info("Shutting down...");
-		paperService.stopRedemptionMonitor();
 		copyService.stopRealRedemptionMonitor();
 		sportsService.stopMonitoring();
 		if (config.USE_POLLING) {
@@ -200,7 +189,6 @@ async function runStart() {
 
 	process.on("SIGTERM", () => {
 		logger.info("Shutting down...");
-		paperService.stopRedemptionMonitor();
 		copyService.stopRealRedemptionMonitor();
 		sportsService.stopMonitoring();
 		if (config.USE_POLLING) {
@@ -252,81 +240,6 @@ async function runAnalyze(address?: string) {
 	}
 
 	console.log("\n" + formatWalletScore(score));
-}
-
-async function runPaperCommand(subcommand?: string, arg?: string) {
-	// Initialize database
-	await getDb();
-
-	const userId = 1; // Default user for CLI
-
-	switch (subcommand) {
-		case "topup": {
-			const amount = parseFloat(arg || "1000");
-			if (isNaN(amount) || amount <= 0) {
-				logger.error("Invalid amount. Usage: bun bot/index.ts paper topup <amount>");
-				return;
-			}
-			const result = paperService.topUpPaperPortfolio(userId, amount);
-			if (result.success) {
-				logger.success(`Added $${amount} to paper portfolio. New balance: $${result.newBalance?.toFixed(2)}`);
-			} else {
-				logger.error(result.error || "Failed to top up portfolio");
-			}
-			break;
-		}
-
-		case "refresh": {
-			logger.info("Refreshing prices for all positions...");
-			const result = await paperService.refreshStalePositionPrices();
-			logger.info(`Refreshed ${result.updated} prices, ${result.failed} failed`);
-			break;
-		}
-
-		case "status": {
-			const portfolio = paperService.getPaperPortfolio(userId);
-			if (!portfolio) {
-				logger.warn("No active paper portfolio");
-				return;
-			}
-			console.log("\nPaper Portfolio Status:");
-			console.log("-".repeat(40));
-			console.log(`Cash: $${portfolio.currentCash.toFixed(2)}`);
-			console.log(`Positions: ${portfolio.positions.length}`);
-			console.log(`Total Value: $${portfolio.totalValue.toFixed(2)}`);
-			console.log(`P&L: $${portfolio.pnl.toFixed(2)} (${portfolio.pnlPercent.toFixed(1)}%)`);
-			console.log(`Tracked Wallets: ${portfolio.wallets.length}`);
-			break;
-		}
-
-		case "reset": {
-			const startAmount = parseFloat(arg || "1000");
-			// Try to reset existing portfolio first
-			const resetResult = paperService.resetPaperPortfolio(userId, startAmount);
-			if (resetResult.success) {
-				logger.success(`Reset paper portfolio to $${startAmount} (positions cleared, wallets kept)`);
-			} else {
-				// No portfolio exists, create new one
-				const result = paperService.startPaperTrading(userId, startAmount);
-				if (result.success) {
-					logger.success(`Created new paper portfolio with $${startAmount}`);
-				} else {
-					logger.error(result.error || "Failed to create portfolio");
-				}
-			}
-			break;
-		}
-
-		default:
-			console.log(`
-Paper Trading Commands:
------------------------
-  bun bot/index.ts paper topup <amount>   Add funds to paper portfolio
-  bun bot/index.ts paper refresh          Refresh prices for all positions
-  bun bot/index.ts paper status           Show portfolio status
-  bun bot/index.ts paper reset [amount]   Reset portfolio (default $1000)
-`);
-	}
 }
 
 function runSetup() {
@@ -389,7 +302,6 @@ COMMANDS:
   start      Start the multi-user bot
   discover   Find profitable wallets (CLI utility)
   analyze    Analyze a specific wallet (CLI utility)
-  paper      Manage paper trading portfolio
   setup      Show setup instructions
   help       Show this help message
 
@@ -397,9 +309,6 @@ EXAMPLES:
   bun bot/index.ts start           # Start the bot
   bun bot/index.ts discover        # Find profitable traders
   bun bot/index.ts analyze 0x...   # Analyze a wallet
-  bun bot/index.ts paper topup 500 # Add $500 to paper portfolio
-  bun bot/index.ts paper refresh   # Refresh position prices
-  bun bot/index.ts paper status    # Show portfolio status
 
 TELEGRAM COMMANDS (once bot is running):
   /start     - Register as user
