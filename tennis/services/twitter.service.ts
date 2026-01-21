@@ -38,7 +38,7 @@ async function lookupUserId(username: string): Promise<string | null> {
       return null;
     }
 
-    const data = await response.json();
+    const data = await response.json() as { data?: { id?: string } };
     return data.data?.id || null;
   } catch (error) {
     logger.error(`Twitter: Error looking up user @${username}`, error);
@@ -211,7 +211,7 @@ async function fetchRecentTweets(): Promise<Tweet[]> {
     return [];
   }
 
-  const data = await response.json();
+  const data = await response.json() as { data?: Tweet[] };
   return data.data || [];
 }
 
@@ -316,13 +316,13 @@ function parseWithdrawal(text: string): { players: string[]; tournament?: string
 
   // Try to extract tournament name from "Tournament update:" format
   const tournamentMatch = text.match(/^([A-Za-z\s]+)\s+update:/i);
-  if (tournamentMatch) {
+  if (tournamentMatch?.[1]) {
     tournament = tournamentMatch[1].trim();
   }
 
   // @EntryLists format: "OUT: Name1, Name2, Name3"
   const outMatch = text.match(/OUT:\s*([^\n]+)/i);
-  if (outMatch) {
+  if (outMatch?.[1]) {
     const namesStr = outMatch[1].trim();
     // Split by comma and clean up each name
     const names = namesStr.split(/,\s*/).map(n => n.trim()).filter(n => n.length > 0);

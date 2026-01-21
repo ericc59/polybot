@@ -238,8 +238,8 @@ describe("Consensus Odds Calculation", () => {
       if (!h2hMarket) continue;
       if (h2hMarket.outcomes.length !== 2) continue;
 
-      const outcome1 = h2hMarket.outcomes[0];
-      const outcome2 = h2hMarket.outcomes[1];
+      const outcome1 = h2hMarket.outcomes[0]!;
+      const outcome2 = h2hMarket.outcomes[1]!;
 
       const prob1 = americanToProb(outcome1.price);
       const prob2 = americanToProb(outcome2.price);
@@ -874,10 +874,10 @@ describe("Slug Parsing", () => {
     const match = slug.match(/^([a-z]+)-([a-z]+)-([a-z]+)-(\d{4}-\d{2}-\d{2})$/);
     if (!match) return null;
     return {
-      sport: match[1],
-      team1: match[2],
-      team2: match[3],
-      date: match[4],
+      sport: match[1]!,
+      team1: match[2]!,
+      team2: match[3]!,
+      date: match[4]!,
     };
   }
 
@@ -1170,7 +1170,7 @@ describe("Value Bet Detection Flow", () => {
   test("end-to-end value bet detection with real fixtures", () => {
     // 1. Parse Polymarket event
     const polyEvent = POLYMARKET_NBA_EVENT;
-    const market = polyEvent.markets[0];
+    const market = polyEvent.markets![0]!;
     expect(market.groupItemTitle).toBe("Winner");
 
     // 2. Parse outcomes and prices
@@ -1186,7 +1186,7 @@ describe("Value Bet Detection Flow", () => {
 
     // 4. Calculate sharp consensus (simplified)
     const fanduelBook = oddsMatch.bookmakers.find((b) => b.key === "fanduel")!;
-    const h2h = fanduelBook.markets[0];
+    const h2h = fanduelBook.markets[0]!;
     const sunsOdds = h2h.outcomes.find((o) => o.name === "Phoenix Suns")!.price;
 
     const sunsProb = americanToProb(sunsOdds); // +100 → 50%
@@ -1214,7 +1214,7 @@ describe("Value Bet Detection Flow", () => {
     });
 
     expect(moneylineMarkets.length).toBe(1);
-    expect(moneylineMarkets[0].groupItemTitle).toBe("Winner");
+    expect(moneylineMarkets[0]!.groupItemTitle).toBe("Winner");
 
     // Verify O/U and spread markets are excluded
     const totalsMarket = markets.find((m) =>

@@ -129,7 +129,7 @@ describe("paper.service", () => {
       // BUY: 100 shares * $0.50 = $50 deducted
       expect(portfolio?.currentCash).toBe(950);
       expect(portfolio?.positions.length).toBe(1);
-      expect(portfolio?.positions[0].shares).toBe(100);
+      expect(portfolio?.positions[0]!.shares).toBe(100);
     });
 
     test("should reject BUY when insufficient funds", async () => {
@@ -171,7 +171,7 @@ describe("paper.service", () => {
       await paperService.processPaperTrade(TEST_USER_ID, "0xwhale", mockTrade, 50);
 
       const portfolioBefore = paperService.getPaperPortfolio(TEST_USER_ID);
-      expect(portfolioBefore?.positions[0].shares).toBe(50);
+      expect(portfolioBefore?.positions[0]!.shares).toBe(50);
 
       // Whale sells 100 shares, but we only have 50
       const sellTrade = { ...mockTrade, side: "SELL" as const, size: "100" };
@@ -216,7 +216,7 @@ describe("paper.service", () => {
       const portfolio = paperService.getPaperPortfolio(TEST_USER_ID);
       // 50% of 100 shares = 50 shares, 50 * $0.50 = $25 deducted
       expect(portfolio?.currentCash).toBe(975);
-      expect(portfolio?.positions[0].shares).toBe(50);
+      expect(portfolio?.positions[0]!.shares).toBe(50);
     });
 
     test("should accumulate position on multiple buys", async () => {
@@ -225,7 +225,7 @@ describe("paper.service", () => {
 
       const portfolio = paperService.getPaperPortfolio(TEST_USER_ID);
       expect(portfolio?.positions.length).toBe(1);
-      expect(portfolio?.positions[0].shares).toBe(200);
+      expect(portfolio?.positions[0]!.shares).toBe(200);
     });
   });
 
@@ -287,7 +287,7 @@ describe("paper.service", () => {
 
       const subscribers = paperService.getPaperSubscribers("0xwhale123");
       expect(subscribers.length).toBe(1);
-      expect(subscribers[0].userId).toBe(TEST_USER_ID);
+      expect(subscribers[0]!.userId).toBe(TEST_USER_ID);
     });
 
     test("should return empty array for untracked wallet", () => {

@@ -104,14 +104,14 @@ describe("Position API Response Transformation", () => {
     const positions = transformApiResponse(MOCK_POSITIONS_API_RESPONSE);
 
     expect(positions.length).toBe(4);
-    expect(positions[0].tokenId).toBe(MOCK_POSITIONS_API_RESPONSE[0].asset);
-    expect(positions[0].size).toBe(25000);
-    expect(positions[0].avgPrice).toBe(0.001);
+    expect(positions[0]!.tokenId).toBe(MOCK_POSITIONS_API_RESPONSE[0]!.asset);
+    expect(positions[0]!.size).toBe(25000);
+    expect(positions[0]!.avgPrice).toBe(0.001);
   });
 
   test("should preserve all required fields", () => {
     const positions = transformApiResponse(MOCK_POSITIONS_API_RESPONSE);
-    const position = positions[1]; // Hornets vs Nuggets
+    const position = positions[1]!; // Hornets vs Nuggets
 
     expect(position.tokenId).toBe("55131559183102232848094659919606716817823138850722565239022300493309926598273");
     expect(position.conditionId).toBe("0xceeeada82ed2bef926122d33af22523058ae27ef56a7d05a175ecd3396fed34b");
@@ -126,16 +126,16 @@ describe("Position API Response Transformation", () => {
     const positions = transformApiResponse(MOCK_POSITIONS_API_RESPONSE);
 
     // Very small price (0.1 cents)
-    expect(positions[0].avgPrice).toBe(0.001);
+    expect(positions[0]!.avgPrice).toBe(0.001);
 
     // Small price (3.69 cents)
-    expect(positions[1].avgPrice).toBe(0.0369);
+    expect(positions[1]!.avgPrice).toBe(0.0369);
 
     // Medium price (5.53 cents)
-    expect(positions[2].avgPrice).toBe(0.0553);
+    expect(positions[2]!.avgPrice).toBe(0.0553);
 
     // Standard price (11 cents)
-    expect(positions[3].avgPrice).toBe(0.11);
+    expect(positions[3]!.avgPrice).toBe(0.11);
   });
 });
 
@@ -144,21 +144,21 @@ describe("Cost Basis from API Data", () => {
     const positions = transformApiResponse(MOCK_POSITIONS_API_RESPONSE);
 
     // Position 1: 25000 shares @ $0.001 = $25
-    expect(positions[0].size * positions[0].avgPrice).toBeCloseTo(25, 2);
+    expect(positions[0]!.size * positions[0]!.avgPrice).toBeCloseTo(25, 2);
 
     // Position 2: 2032.1859 shares @ $0.0369 = ~$75
-    expect(positions[1].size * positions[1].avgPrice).toBeCloseTo(74.99, 1);
+    expect(positions[1]!.size * positions[1]!.avgPrice).toBeCloseTo(74.99, 1);
 
     // Position 3: 1500.1453 shares @ $0.0553 = ~$83
-    expect(positions[2].size * positions[2].avgPrice).toBeCloseTo(82.96, 1);
+    expect(positions[2]!.size * positions[2]!.avgPrice).toBeCloseTo(82.96, 1);
 
     // Position 4: 454.5 shares @ $0.11 = ~$50
-    expect(positions[3].size * positions[3].avgPrice).toBeCloseTo(49.995, 2);
+    expect(positions[3]!.size * positions[3]!.avgPrice).toBeCloseTo(49.995, 2);
   });
 
   test("cost basis should match API initialValue", () => {
     // The API provides initialValue which should equal size * avgPrice
-    const position = MOCK_POSITIONS_API_RESPONSE[1]; // Hornets vs Nuggets
+    const position = MOCK_POSITIONS_API_RESPONSE[1]!; // Hornets vs Nuggets
 
     const calculatedCostBasis = position.size * position.avgPrice;
     const apiInitialValue = position.initialValue;

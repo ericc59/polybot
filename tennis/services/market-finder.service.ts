@@ -93,7 +93,7 @@ async function fetchEventBySlug(slug: string): Promise<CachedEvent | null> {
     if (response.ok) {
       const data = (await response.json()) as CachedEvent[];
       if (data.length > 0) {
-        return data[0];
+        return data[0] ?? null;
       }
     }
   } catch (error) {
@@ -176,7 +176,7 @@ function getNameVariants(fullName: string): string[] {
   if (filteredParts.length === 0) return ["unknown"];
 
   // Standard: last name - try 6, 7, and 2 char truncations (Polymarket varies)
-  const lastName = filteredParts[filteredParts.length - 1];
+  const lastName = filteredParts[filteredParts.length - 1]!;
   variants.push(lastName.slice(0, 6));
   if (lastName.length >= 7) {
     variants.push(lastName.slice(0, 7));
@@ -192,8 +192,8 @@ function getNameVariants(fullName: string): string[] {
 
   // For 2-part names
   if (filteredParts.length === 2) {
-    const first = filteredParts[0];
-    const last = filteredParts[1];
+    const first = filteredParts[0]!;
+    const last = filteredParts[1]!;
 
     // Try concatenated version for short names (e.g., "Ann Li" → "annli")
     if (first.length <= 4 && last.length <= 4) {
@@ -213,7 +213,7 @@ function getNameVariants(fullName: string): string[] {
   // For names with 3+ parts (like "Maria Camila Osorio Serrano")
   // Try the second-to-last part as well (common Hispanic pattern)
   if (filteredParts.length >= 3) {
-    const secondLast = filteredParts[filteredParts.length - 2];
+    const secondLast = filteredParts[filteredParts.length - 2]!;
     variants.push(secondLast.slice(0, 6));
     if (secondLast.length >= 7) {
       variants.push(secondLast.slice(0, 7));

@@ -295,7 +295,7 @@ async function runPaperCommand(subcommand?: string, arg?: string) {
 			console.log(`Positions: ${portfolio.positions.length}`);
 			console.log(`Total Value: $${portfolio.totalValue.toFixed(2)}`);
 			console.log(`P&L: $${portfolio.pnl.toFixed(2)} (${portfolio.pnlPercent.toFixed(1)}%)`);
-			console.log(`Tracked Wallets: ${portfolio.trackedWallets.length}`);
+			console.log(`Tracked Wallets: ${portfolio.wallets.length}`);
 			break;
 		}
 

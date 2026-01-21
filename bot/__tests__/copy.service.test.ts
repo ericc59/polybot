@@ -49,8 +49,8 @@ describe("copy.service", () => {
 
         const subs = copyService.getCopySubscriptions(TEST_USER_ID);
         expect(subs.length).toBe(1);
-        expect(subs[0].sourceWallet).toBe(TEST_WALLET.toLowerCase());
-        expect(subs[0].mode).toBe("recommend");
+        expect(subs[0]!.sourceWallet).toBe(TEST_WALLET.toLowerCase());
+        expect(subs[0]!.mode).toBe("recommend");
       });
 
       test("should subscribe to a wallet in auto mode", () => {
@@ -58,7 +58,7 @@ describe("copy.service", () => {
         expect(result).toBe(true);
 
         const subs = copyService.getCopySubscriptions(TEST_USER_ID);
-        expect(subs[0].mode).toBe("auto");
+        expect(subs[0]!.mode).toBe("auto");
       });
 
       test("should update mode on duplicate subscription", () => {
@@ -67,14 +67,14 @@ describe("copy.service", () => {
 
         const subs = copyService.getCopySubscriptions(TEST_USER_ID);
         expect(subs.length).toBe(1);
-        expect(subs[0].mode).toBe("auto");
+        expect(subs[0]!.mode).toBe("auto");
       });
 
       test("should normalize wallet address to lowercase", () => {
         copyService.subscribeToCopy(TEST_USER_ID, "0xABCDEF", "recommend");
 
         const subs = copyService.getCopySubscriptions(TEST_USER_ID);
-        expect(subs[0].sourceWallet).toBe("0xabcdef");
+        expect(subs[0]!.sourceWallet).toBe("0xabcdef");
       });
 
       test("should allow multiple wallet subscriptions", () => {
@@ -111,7 +111,7 @@ describe("copy.service", () => {
 
         const subs = copyService.getCopySubscriptions(TEST_USER_ID);
         expect(subs.length).toBe(1);
-        expect(subs[0].sourceWallet).toBe("0xwallet2");
+        expect(subs[0]!.sourceWallet).toBe("0xwallet2");
       });
     });
 
@@ -167,7 +167,7 @@ describe("copy.service", () => {
         copyService.saveTradingWallet(TEST_USER_ID, "0xmywallet", "creds");
 
         const wallet = copyService.getTradingWallet(TEST_USER_ID);
-        expect(wallet?.copyEnabled).toBe(0); // Default disabled
+        expect(wallet?.copyEnabled).toBeFalsy(); // Default disabled
         expect(wallet?.copyPercentage).toBe(10); // Default 10%
       });
     });
@@ -181,7 +181,7 @@ describe("copy.service", () => {
         copyService.updateTradingSettings(TEST_USER_ID, { copyEnabled: true });
 
         const wallet = copyService.getTradingWallet(TEST_USER_ID);
-        expect(wallet?.copyEnabled).toBe(1);
+        expect(wallet?.copyEnabled).toBeTruthy();
       });
 
       test("should update copyPercentage", () => {
@@ -214,7 +214,7 @@ describe("copy.service", () => {
         });
 
         const wallet = copyService.getTradingWallet(TEST_USER_ID);
-        expect(wallet?.copyEnabled).toBe(1);
+        expect(wallet?.copyEnabled).toBeTruthy();
         expect(wallet?.copyPercentage).toBe(75);
         expect(wallet?.maxTradeSize).toBe(200);
         expect(wallet?.dailyLimit).toBe(1000);
@@ -279,8 +279,8 @@ describe("copy.service", () => {
         expect(recordId).toBeGreaterThan(0);
 
         const history = copyService.getCopyTradeHistory(TEST_USER_ID);
-        expect(history[0].status).toBe("failed");
-        expect(history[0].errorMessage).toBe("Insufficient funds");
+        expect(history[0]!.status).toBe("failed");
+        expect(history[0]!.errorMessage).toBe("Insufficient funds");
       });
     });
 
@@ -327,7 +327,7 @@ describe("copy.service", () => {
         // The second insert has higher id, so it should be first when sorted DESC
         // Verify proper ordering by checking relative positions
         expect(id2).toBeGreaterThan(id1);
-        expect(history[0].id).toBeGreaterThan(history[1].id);
+        expect(history[0]!.id).toBeGreaterThan(history[1]!.id);
       });
 
       test("should respect limit parameter", () => {
@@ -417,9 +417,9 @@ describe("copy.service", () => {
         copyService.updateCopyTradeStatus(recordId, "executed", "order-123", "0xresulttx");
 
         const history = copyService.getCopyTradeHistory(TEST_USER_ID);
-        expect(history[0].status).toBe("executed");
-        expect(history[0].orderId).toBe("order-123");
-        expect(history[0].txHash).toBe("0xresulttx");
+        expect(history[0]!.status).toBe("executed");
+        expect(history[0]!.orderId).toBe("order-123");
+        expect(history[0]!.txHash).toBe("0xresulttx");
       });
 
       test("should update trade status to failed with error", () => {
@@ -441,8 +441,8 @@ describe("copy.service", () => {
         copyService.updateCopyTradeStatus(recordId, "failed", undefined, undefined, "Order rejected");
 
         const history = copyService.getCopyTradeHistory(TEST_USER_ID);
-        expect(history[0].status).toBe("failed");
-        expect(history[0].errorMessage).toBe("Order rejected");
+        expect(history[0]!.status).toBe("failed");
+        expect(history[0]!.errorMessage).toBe("Order rejected");
       });
     });
   });

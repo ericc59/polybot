@@ -128,7 +128,7 @@ async function runStart() {
       // POST /trigger-walkover
       if (url.pathname === "/trigger-walkover" && req.method === "POST") {
         try {
-          const body = await req.json();
+          const body = await req.json() as { matchId?: number };
           const matchId = body.matchId;
 
           if (!matchId) {

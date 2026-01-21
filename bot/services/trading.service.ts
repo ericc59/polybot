@@ -24,6 +24,8 @@ export {
 	calculateMarketPrice,
 } from "../../lib/trading/orders";
 
+import type { TradeResult } from "../../lib/trading/types";
+
 export type {
 	TradingWallet,
 	TradeResult,
