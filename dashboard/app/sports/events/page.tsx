@@ -194,9 +194,10 @@ export default function EventsPage() {
       ) : (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {events.map((event) => (
-            <div
+            <Link
               key={event.id}
-              className={`card p-4 ${event.hasValueBet ? 'border-[var(--positive)]/50' : ''}`}
+              href={`/sports/events/${encodeURIComponent(event.id)}`}
+              className={`card p-4 block hover:bg-[var(--bg-secondary)] transition-colors cursor-pointer ${event.hasValueBet ? 'border-[var(--positive)]/50' : ''}`}
             >
               {/* Header */}
               <div className="flex items-center justify-between mb-3">
@@ -241,16 +242,11 @@ export default function EventsPage() {
                 </div>
               )}
 
-              {/* Link to Polymarket */}
-              <a
-                href={`https://polymarket.com/event/${event.slug}`}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="mt-3 block text-center text-xs text-[var(--accent-primary)] hover:underline"
-              >
-                View on Polymarket →
-              </a>
-            </div>
+              {/* View Details */}
+              <div className="mt-3 text-center text-xs text-[var(--accent-primary)]">
+                View Details →
+              </div>
+            </Link>
           ))}
         </div>
       )}

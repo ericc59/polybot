@@ -206,3 +206,47 @@ CREATE TABLE IF NOT EXISTS user_ignored_markets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_ignored_markets_user ON user_ignored_markets(user_id);
+
+-- =============================================
+-- SPORTS ODDS CACHE (latest odds for dashboard)
+-- =============================================
+CREATE TABLE IF NOT EXISTS sports_odds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  match_id TEXT NOT NULL,
+  sport TEXT NOT NULL,
+  home_team TEXT NOT NULL,
+  away_team TEXT NOT NULL,
+  commence_time TEXT NOT NULL,
+  -- Polymarket data
+  poly_slug TEXT,
+  poly_condition_id TEXT,
+  poly_home_price REAL,
+  poly_away_price REAL,
+  poly_home_token_id TEXT,
+  poly_away_token_id TEXT,
+  -- Sharp consensus
+  sharp_home_prob REAL,
+  sharp_away_prob REAL,
+  book_count INTEGER,
+  variance REAL,
+  -- Edge calculations
+  home_edge REAL,
+  away_edge REAL,
+  min_edge_required REAL,
+  -- Book breakdown (JSON)
+  home_book_data TEXT,
+  away_book_data TEXT,
+  -- Excluded books (JSON) - books that were skipped with reasons
+  home_excluded_books TEXT,
+  away_excluded_books TEXT,
+  -- Timestamps
+  updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+  UNIQUE(match_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sports_odds_match ON sports_odds(match_id);
+CREATE INDEX IF NOT EXISTS idx_sports_odds_updated ON sports_odds(updated_at);
+
+-- Migration: Add excluded books columns to sports_odds
+ALTER TABLE sports_odds ADD COLUMN home_excluded_books TEXT;
+ALTER TABLE sports_odds ADD COLUMN away_excluded_books TEXT;

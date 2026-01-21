@@ -16,10 +16,15 @@ export const DEFAULT_SPORTS_CONFIG: SportsConfig = {
   maxBetPct: 0.03, // 3% max per bet
   maxExposurePct: 0.5, // 25% max exposure (total open position value)
   minBetUsd: 0.5, // $0.5 minimum
-  maxBetUsd: 5, // $1 maximum per bet
+  maxBetUsd: 5, // $5 maximum per bet
   maxPerMarket: 25, // $25 max total exposure per outcome
-  sharesPerBet: 25, // Fixed 25 shares per bet (set to 0 to use dollar-based sizing)
-  maxSharesPerMarket: 100, // Max 100 shares per outcome
+  sharesPerBet: 5, // Fixed 5 shares per bet (set to 0 to use dollar-based sizing)
+  maxSharesPerMarket: 25, // Max 25 shares per outcome (legacy, use pre/in-game instead)
+  // Pre-game vs in-game allocation limits
+  maxSharesPreGame: 25, // Max 25 shares per outcome before game starts
+  maxSharesInGame: 10, // Max 10 shares per outcome during live game
+  maxPerMarketPreGame: 25, // $25 max per outcome pre-game
+  maxPerMarketInGame: 10, // $10 max per outcome in-game
   booksRequired: 2, // Consensus from 2+ books
   maxBetsPerEvent: 15, // Max bets per event (prevents correlated bets)
   sports: [
@@ -43,6 +48,12 @@ export const DEFAULT_SPORTS_CONFIG: SportsConfig = {
   // Improvement 3: Edge reversal exit
   edgeReversalEnabled: false, // Disabled - exit methodology TBD
   edgeReversalThreshold: -0.02, // Sell if edge drops below -2%
+  // Price-based edge thresholds (require higher edge for extreme prices)
+  priceEdgeEnabled: true,
+  edgePrice15to25: 0.12, // 12% edge for 15-25¢ (long shots need more edge)
+  edgePrice25to35: 0.08, // 8% edge for 25-35¢
+  edgePrice35to65: 0.06, // 6% edge for 35-65¢ (sweet spot)
+  edgePrice65to85: 0.08, // 8% edge for 65-85¢ (favorites need more edge)
   // Improvement 5: Correlated position limits
   correlationEnabled: true,
   sameEventCorrelation: 0.8, // High correlation for same event

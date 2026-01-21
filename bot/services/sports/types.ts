@@ -46,6 +46,14 @@ export interface ValueBet {
   consensusVariance?: number;
   dynamicMinEdge?: number;
   bookData?: BookData[];
+  // Other side data for full market context
+  otherSide?: {
+    outcome: string;
+    polymarketPrice: number;
+    sharpProb: number;
+    edge: number;
+    bookData?: BookData[];
+  };
 }
 
 export interface BookData {
@@ -69,6 +77,11 @@ export interface SportsConfig {
   maxPerMarket: number;
   sharesPerBet: number;
   maxSharesPerMarket: number;
+  // Pre-game vs in-game allocation limits
+  maxSharesPreGame: number;
+  maxSharesInGame: number;
+  maxPerMarketPreGame: number;
+  maxPerMarketInGame: number;
   booksRequired: number;
   maxBetsPerEvent: number;
   sports: string[];
@@ -84,6 +97,12 @@ export interface SportsConfig {
   maxEdgeMultiplier: number;
   edgeReversalEnabled: boolean;
   edgeReversalThreshold: number;
+  // Price-based edge thresholds (higher edge required for extreme prices)
+  priceEdgeEnabled: boolean;
+  edgePrice15to25: number; // 15-25¢ (long shots)
+  edgePrice25to35: number; // 25-35¢
+  edgePrice35to65: number; // 35-65¢ (middle range)
+  edgePrice65to85: number; // 65-85¢ (favorites)
   correlationEnabled: boolean;
   sameEventCorrelation: number;
   sameDayCorrelation: number;

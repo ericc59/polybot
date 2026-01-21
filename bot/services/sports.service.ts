@@ -957,13 +957,22 @@ function americanToProb(americanOdds: number): number {
   }
 }
 
+interface ExcludedBook {
+  key: string;
+  reason: 'missing' | 'stale' | 'skip' | 'outlier';
+  odds?: number;
+  fairProb?: number;
+  details?: string;
+}
+
 function calculateConsensusOdds(
   match: OddsApiMatch,
   outcome: string,
   minBooks: number,
   debug: boolean = false
-): { avgProb: number; bookCount: number; details: string[]; variance: number; bookProbs: number[]; bookData: BookData[] } | null {
+): { avgProb: number; bookCount: number; details: string[]; variance: number; bookProbs: number[]; bookData: BookData[]; excludedBooks: ExcludedBook[] } | null {
   const bookData: BookData[] = [];
+  const excludedBooks: ExcludedBook[] = [];
   const details: string[] = [];
   const now = Date.now();
 
@@ -971,6 +980,7 @@ function calculateConsensusOdds(
   for (const sharpKey of SHARP_BOOKS) {
     const bookmaker = match.bookmakers.find(b => b.key.toLowerCase() === sharpKey);
     if (!bookmaker) {
+      excludedBooks.push({ key: sharpKey, reason: 'missing' });
       if (debug) details.push(`    [MISSING] ${sharpKey}`);
       continue;
     }
@@ -979,8 +989,9 @@ function calculateConsensusOdds(
     const lastUpdate = new Date(bookmaker.last_update).getTime();
     const ageMs = now - lastUpdate;
     if (ageMs > MAX_ODDS_AGE_MS) {
+      const ageMins = Math.round(ageMs / 60000);
+      excludedBooks.push({ key: sharpKey, reason: 'stale', details: `${ageMins}m old` });
       if (debug) {
-        const ageMins = Math.round(ageMs / 60000);
         details.push(`    [STALE] ${sharpKey} (${ageMins}m old)`);
       }
       continue;
@@ -1008,6 +1019,7 @@ function calculateConsensusOdds(
 
     if (!isOutcome1 && !isOutcome2) {
       // Neither outcome matches - skip this book (data mismatch)
+      excludedBooks.push({ key: bookmaker.key, reason: 'skip', details: `no match for "${outcome}"` });
       if (debug) details.push(`    [SKIP] ${bookmaker.key}: no outcome matches "${outcome}"`);
       continue;
     }
@@ -1041,10 +1053,17 @@ function calculateConsensusOdds(
       const threshold = 2 * stdDev;
       filteredBookData = bookData.filter(b => Math.abs(b.fairProb - median) <= threshold);
 
-      // Log removed outliers
+      // Track removed outliers
       const removed = bookData.filter(b => Math.abs(b.fairProb - median) > threshold);
-      if (removed.length > 0 && debug) {
-        for (const r of removed) {
+      for (const r of removed) {
+        excludedBooks.push({
+          key: r.key,
+          reason: 'outlier',
+          odds: r.odds,
+          fairProb: r.fairProb,
+          details: `${(r.fairProb * 100).toFixed(1)}% vs median ${(median * 100).toFixed(1)}%`
+        });
+        if (debug) {
           details.push(`    [OUTLIER] ${r.key}: ${(r.fairProb * 100).toFixed(1)}% (median: ${(median * 100).toFixed(1)}%, stdDev: ${(stdDev * 100).toFixed(1)}%)`);
         }
       }
@@ -1064,7 +1083,7 @@ function calculateConsensusOdds(
     ? bookProbs.reduce((sum, p) => sum + Math.pow(p - avgProb, 2), 0) / bookProbs.length
     : 0;
 
-  return { avgProb, bookCount: filteredBookData.length, details, variance, bookProbs, bookData: filteredBookData };
+  return { avgProb, bookCount: filteredBookData.length, details, variance, bookProbs, bookData: filteredBookData, excludedBooks };
 }
 
 /**
@@ -1099,6 +1118,197 @@ function calculateDynamicMinEdge(
   }
 
   return baseEdge;
+}
+
+/**
+ * Calculate minimum edge based on price tier
+ * Extreme prices (long shots and heavy favorites) require higher edge
+ */
+function getMinEdgeForPrice(price: number, config: SportsConfig): number {
+  if (!config.priceEdgeEnabled) {
+    return config.minEdge;
+  }
+
+  // Price tiers with required edges
+  if (price >= 0.15 && price < 0.25) {
+    return config.edgePrice15to25; // Long shots - need high edge
+  } else if (price >= 0.25 && price < 0.35) {
+    return config.edgePrice25to35;
+  } else if (price >= 0.35 && price < 0.65) {
+    return config.edgePrice35to65; // Sweet spot - lower edge OK
+  } else if (price >= 0.65 && price <= 0.85) {
+    return config.edgePrice65to85; // Favorites - need more edge
+  } else {
+    // Outside 15-85¢ range - use fallback (minPrice should filter these anyway)
+    return config.minEdge;
+  }
+}
+
+/**
+ * Get effective minimum edge considering both book confidence and price tier
+ * Returns the HIGHER of the two thresholds
+ */
+function getEffectiveMinEdge(
+  price: number,
+  bookCount: number,
+  variance: number,
+  config: SportsConfig
+): number {
+  const bookBasedEdge = calculateDynamicMinEdge(bookCount, variance, config);
+  const priceBasedEdge = getMinEdgeForPrice(price, config);
+  return Math.max(bookBasedEdge, priceBasedEdge);
+}
+
+/**
+ * Log detailed EV breakdown when placing a bet
+ */
+function logBetEvBreakdown(bet: ValueBet, betSize: number, shares: number, config: SportsConfig): void {
+  const polyPriceCents = (bet.polymarketPrice * 100).toFixed(1);
+  const sharpProbCents = (bet.sharpProb * 100).toFixed(1);
+  const edgePct = (bet.edge * 100).toFixed(2);
+  const minEdgePct = ((bet.dynamicMinEdge || config.minEdge) * 100).toFixed(1);
+  const priceMinEdge = getMinEdgeForPrice(bet.polymarketPrice, config);
+  const priceMinEdgePct = (priceMinEdge * 100).toFixed(1);
+
+  // Get price tier label
+  let priceTier: string;
+  const p = bet.polymarketPrice;
+  if (p >= 0.15 && p < 0.25) priceTier = "15-25¢ (long shot)";
+  else if (p >= 0.25 && p < 0.35) priceTier = "25-35¢";
+  else if (p >= 0.35 && p < 0.65) priceTier = "35-65¢ (sweet spot)";
+  else if (p >= 0.65 && p <= 0.85) priceTier = "65-85¢ (favorite)";
+  else priceTier = "outside range";
+
+  console.log("\n╔══════════════════════════════════════════════════════════════════╗");
+  console.log("║                      EV BET BREAKDOWN                            ║");
+  console.log("╠══════════════════════════════════════════════════════════════════╣");
+  console.log(`║ Match: ${bet.homeTeam} vs ${bet.awayTeam}`.padEnd(67) + "║");
+  console.log(`║ Sport: ${bet.sport}`.padEnd(67) + "║");
+  console.log("╠══════════════════════════════════════════════════════════════════╣");
+  console.log("║ POLYMARKET PRICES                                                ║");
+  console.log(`║   → ${bet.outcome}: ${polyPriceCents}¢  ← BETTING THIS`.padEnd(67) + "║");
+  if (bet.otherSide) {
+    console.log(`║     ${bet.otherSide.outcome}: ${(bet.otherSide.polymarketPrice * 100).toFixed(1)}¢`.padEnd(67) + "║");
+    const totalPoly = bet.polymarketPrice + bet.otherSide.polymarketPrice;
+    console.log(`║     Total: ${(totalPoly * 100).toFixed(1)}¢ (vig: ${((totalPoly - 1) * 100).toFixed(1)}%)`.padEnd(67) + "║");
+  }
+  console.log("╠══════════════════════════════════════════════════════════════════╣");
+  console.log("║ SHARP BOOKS CONSENSUS                                            ║");
+  console.log(`║   → ${bet.outcome}: ${sharpProbCents}% (${bet.bookmakerConsensus} books)`.padEnd(67) + "║");
+  if (bet.otherSide) {
+    console.log(`║     ${bet.otherSide.outcome}: ${(bet.otherSide.sharpProb * 100).toFixed(1)}%`.padEnd(67) + "║");
+  }
+  if (bet.consensusVariance !== undefined) {
+    console.log(`║     Variance: ${(bet.consensusVariance * 100).toFixed(2)}%`.padEnd(67) + "║");
+  }
+
+  // Log individual book data for betting side
+  if (bet.bookData && bet.bookData.length > 0) {
+    console.log("║   ─────────────────────────────────────────────────────────────  ║");
+    console.log(`║   ${bet.outcome} odds by book:`.padEnd(67) + "║");
+    for (const book of bet.bookData) {
+      const oddsStr = book.odds > 0 ? `+${book.odds}` : `${book.odds}`;
+      const bookLine = `║     ${book.key.padEnd(12)} ${oddsStr.padEnd(6)} → raw ${(book.rawProb * 100).toFixed(1)}% → fair ${(book.fairProb * 100).toFixed(1)}%`;
+      console.log(bookLine.padEnd(67) + "║");
+    }
+  }
+
+  // Log other side book data
+  if (bet.otherSide?.bookData && bet.otherSide.bookData.length > 0) {
+    console.log("║   ─────────────────────────────────────────────────────────────  ║");
+    console.log(`║   ${bet.otherSide.outcome} odds by book:`.padEnd(67) + "║");
+    for (const book of bet.otherSide.bookData) {
+      const oddsStr = book.odds > 0 ? `+${book.odds}` : `${book.odds}`;
+      const bookLine = `║     ${book.key.padEnd(12)} ${oddsStr.padEnd(6)} → raw ${(book.rawProb * 100).toFixed(1)}% → fair ${(book.fairProb * 100).toFixed(1)}%`;
+      console.log(bookLine.padEnd(67) + "║");
+    }
+  }
+
+  console.log("╠══════════════════════════════════════════════════════════════════╣");
+  console.log("║ EDGE CALCULATION                                                 ║");
+  console.log(`║   Formula: (sharpProb - polyPrice) / polyPrice`.padEnd(67) + "║");
+  console.log(`║   → ${bet.outcome}: (${sharpProbCents}% - ${polyPriceCents}¢) / ${polyPriceCents}¢ = +${edgePct}%`.padEnd(67) + "║");
+  if (bet.otherSide) {
+    const otherEdgePct = (bet.otherSide.edge * 100).toFixed(2);
+    const otherEdgeSign = bet.otherSide.edge >= 0 ? "+" : "";
+    console.log(`║     ${bet.otherSide.outcome}: ${otherEdgeSign}${otherEdgePct}%`.padEnd(67) + "║");
+  }
+  console.log("╠══════════════════════════════════════════════════════════════════╣");
+  console.log("║ THRESHOLDS                                                       ║");
+  console.log(`║   Price tier: ${priceTier} → min ${priceMinEdgePct}%`.padEnd(67) + "║");
+  console.log(`║   Effective min edge: ${minEdgePct}%`.padEnd(67) + "║");
+  console.log(`║   Edge ${edgePct}% >= ${minEdgePct}% ✓`.padEnd(67) + "║");
+  console.log("╠══════════════════════════════════════════════════════════════════╣");
+  console.log("║ BET SIZE                                                         ║");
+  console.log(`║   Shares: ${shares.toFixed(1)}`.padEnd(67) + "║");
+  console.log(`║   Cost: $${betSize.toFixed(2)} (${shares.toFixed(1)} × ${polyPriceCents}¢)`.padEnd(67) + "║");
+  console.log(`║   Potential payout: $${shares.toFixed(2)} (if wins)`.padEnd(67) + "║");
+  console.log(`║   Expected value: $${(shares * bet.edge).toFixed(2)}`.padEnd(67) + "║");
+  console.log("╚══════════════════════════════════════════════════════════════════╝\n");
+}
+
+/**
+ * Generate EV breakdown text for Telegram
+ */
+function generateEvBreakdownText(bet: ValueBet, betSize: number, shares: number, config: SportsConfig): string {
+  const polyPriceCents = (bet.polymarketPrice * 100).toFixed(1);
+  const sharpProbCents = (bet.sharpProb * 100).toFixed(1);
+  const edgePct = (bet.edge * 100).toFixed(2);
+  const minEdgePct = ((bet.dynamicMinEdge || config.minEdge) * 100).toFixed(1);
+
+  let text = `📊 *EV Breakdown*\n\n`;
+  text += `*Match:* ${bet.homeTeam} vs ${bet.awayTeam}\n\n`;
+
+  // Polymarket prices
+  text += `*Polymarket:*\n`;
+  text += `→ ${bet.outcome}: ${polyPriceCents}¢ ← BET\n`;
+  if (bet.otherSide) {
+    text += `   ${bet.otherSide.outcome}: ${(bet.otherSide.polymarketPrice * 100).toFixed(1)}¢\n`;
+  }
+  text += `\n`;
+
+  // Sharp consensus
+  text += `*Sharp Consensus (${bet.bookmakerConsensus} books):*\n`;
+  text += `→ ${bet.outcome}: ${sharpProbCents}%\n`;
+  if (bet.otherSide) {
+    text += `   ${bet.otherSide.outcome}: ${(bet.otherSide.sharpProb * 100).toFixed(1)}%\n`;
+  }
+  text += `\n`;
+
+  // Book details
+  if (bet.bookData && bet.bookData.length > 0) {
+    text += `*${bet.outcome} by book:*\n`;
+    for (const book of bet.bookData) {
+      const oddsStr = book.odds > 0 ? `+${book.odds}` : `${book.odds}`;
+      text += `  ${book.key}: ${oddsStr} → ${(book.fairProb * 100).toFixed(1)}%\n`;
+    }
+    text += `\n`;
+  }
+
+  if (bet.otherSide?.bookData && bet.otherSide.bookData.length > 0) {
+    text += `*${bet.otherSide.outcome} by book:*\n`;
+    for (const book of bet.otherSide.bookData) {
+      const oddsStr = book.odds > 0 ? `+${book.odds}` : `${book.odds}`;
+      text += `  ${book.key}: ${oddsStr} → ${(book.fairProb * 100).toFixed(1)}%\n`;
+    }
+    text += `\n`;
+  }
+
+  // Edge
+  text += `*Edge:*\n`;
+  text += `→ ${bet.outcome}: +${edgePct}% (min: ${minEdgePct}%)\n`;
+  if (bet.otherSide) {
+    const otherEdgePct = (bet.otherSide.edge * 100).toFixed(2);
+    const otherEdgeSign = bet.otherSide.edge >= 0 ? "+" : "";
+    text += `   ${bet.otherSide.outcome}: ${otherEdgeSign}${otherEdgePct}%\n`;
+  }
+  text += `\n`;
+
+  // Bet size
+  text += `*Bet:* ${shares.toFixed(1)} shares @ ${polyPriceCents}¢ = $${betSize.toFixed(2)}\n`;
+  text += `*EV:* $${(shares * bet.edge).toFixed(2)}`;
+
+  return text;
 }
 
 // =============================================
@@ -1223,6 +1433,48 @@ async function findValueBetsForEvent(
 			return [];
 		}
 
+		// Get consensus odds for both sides to save to database
+		const homeConsensus = calculateConsensusOdds(oddsMatch, oddsMatch.home_team, config.booksRequired, false);
+		const awayConsensus = calculateConsensusOdds(oddsMatch, oddsMatch.away_team, config.booksRequired, false);
+
+		// Determine which outcome is home/away
+		const outcome0IsHome = outcomeMatchesTeam(outcomes[0]!, oddsMatch.home_team);
+		const homePolyPrice = outcome0IsHome ? polyPrice0 : polyPrice1;
+		const awayPolyPrice = outcome0IsHome ? polyPrice1 : polyPrice0;
+		const homeTokenId = outcome0IsHome ? tokenIds[0]! : tokenIds[1]!;
+		const awayTokenId = outcome0IsHome ? tokenIds[1]! : tokenIds[0]!;
+
+		// Save odds to database for ALL games (regardless of edge)
+		if (homeConsensus || awayConsensus) {
+			const homeEdge = homeConsensus ? (homeConsensus.avgProb - homePolyPrice) / homePolyPrice : null;
+			const awayEdge = awayConsensus ? (awayConsensus.avgProb - awayPolyPrice) / awayPolyPrice : null;
+
+			saveOddsToDbDirect({
+				matchId: oddsMatch.id,
+				sport: oddsMatch.sport_title,
+				homeTeam: oddsMatch.home_team,
+				awayTeam: oddsMatch.away_team,
+				commenceTime: oddsMatch.commence_time,
+				polySlug: polyEvent.slug,
+				polyConditionId: moneylineMarket.conditionId,
+				polyHomePrice: homePolyPrice,
+				polyAwayPrice: awayPolyPrice,
+				polyHomeTokenId: homeTokenId,
+				polyAwayTokenId: awayTokenId,
+				sharpHomeProb: homeConsensus?.avgProb || null,
+				sharpAwayProb: awayConsensus?.avgProb || null,
+				bookCount: homeConsensus?.bookCount || awayConsensus?.bookCount || 0,
+				variance: homeConsensus?.variance || awayConsensus?.variance || null,
+				homeEdge,
+				awayEdge,
+				minEdgeRequired: config.minEdge,
+				homeBookData: homeConsensus?.bookData || [],
+				awayBookData: awayConsensus?.bookData || [],
+				homeExcludedBooks: homeConsensus?.excludedBooks || [],
+				awayExcludedBooks: awayConsensus?.excludedBooks || [],
+			});
+		}
+
 		// Check both outcomes for value
 		for (let i = 0; i < outcomes.length; i++) {
 			const outcomeName = outcomes[i]!;
@@ -1254,8 +1506,9 @@ async function findValueBetsForEvent(
 			const sharpProb = consensus.avgProb;
 			const edge = (sharpProb - polyPrice) / polyPrice;
 
-			// Calculate dynamic edge threshold based on book confidence (Improvement 1)
-			const dynamicMinEdge = calculateDynamicMinEdge(
+			// Calculate effective min edge (considers both book confidence and price tier)
+			const dynamicMinEdge = getEffectiveMinEdge(
+				polyPrice,
 				consensus.bookCount,
 				consensus.variance,
 				config
@@ -1291,6 +1544,20 @@ async function findValueBetsForEvent(
 				const recommendedPct = kellyPct * config.kellyFraction;
 				const cappedPct = Math.min(recommendedPct, config.maxBetPct);
 
+				// Get other side data for full market context
+				const otherIdx = i === 0 ? 1 : 0;
+				const otherOutcomeName = outcomes[otherIdx]!;
+				const otherPolyPrice = otherIdx === 0 ? polyPrice0 : polyPrice1;
+				const otherOddsTeamName = oddsTeamName === oddsMatch.home_team ? oddsMatch.away_team : oddsMatch.home_team;
+				const otherConsensus = calculateConsensusOdds(
+					oddsMatch,
+					otherOddsTeamName,
+					config.booksRequired,
+					false,
+				);
+				const otherSharpProb = otherConsensus?.avgProb || (1 - sharpProb);
+				const otherEdge = otherConsensus ? (otherSharpProb - otherPolyPrice) / otherPolyPrice : 0;
+
 				valueBets.push({
 					id: `${oddsMatch.id}-${i}`,
 					matchId: oddsMatch.id,
@@ -1313,6 +1580,13 @@ async function findValueBetsForEvent(
 					consensusVariance: consensus.variance,
 					dynamicMinEdge,
 					bookData: consensus.bookData,
+					otherSide: {
+						outcome: otherOddsTeamName,
+						polymarketPrice: otherPolyPrice,
+						sharpProb: otherSharpProb,
+						edge: otherEdge,
+						bookData: otherConsensus?.bookData,
+					},
 				});
 			}
 		}
@@ -1505,8 +1779,9 @@ export async function findValueBets(
 						const sharpProb = consensus.avgProb;
 						const edge = (sharpProb - polyPrice) / polyPrice;
 
-						// Calculate dynamic edge threshold based on book confidence (Improvement 1)
-						const dynamicMinEdge = calculateDynamicMinEdge(
+						// Calculate effective min edge (considers both book confidence and price tier)
+						const dynamicMinEdge = getEffectiveMinEdge(
+							polyPrice,
 							consensus.bookCount,
 							consensus.variance,
 							config
@@ -1733,6 +2008,11 @@ async function pollForValueBets(userId: number, config: SportsConfig, debug: boo
 					logger.edgesSorted(edgeDataCollector);
 				}
 
+				// Save all odds data to database for dashboard
+				if (currentValueBets.length > 0) {
+					saveAllOddsToDatabase(currentValueBets);
+				}
+
     // Convert poly events to tracked events for dashboard
 				currentTrackedEvents = polyEvents.map((event) => {
 					const sport = detectSportFromSlug(event.slug);
@@ -1869,28 +2149,35 @@ async function executeValueBet(
         return { success: false, error: `Insufficient balance for ${shares} shares ($${betSize.toFixed(2)} needed, $${balance.toFixed(2)} available)` };
       }
 
-      // Check max shares per market
+      // Determine if game is live (has started) for allocation limits
+      const gameStartTime = new Date(bet.commenceTime).getTime();
+      const isLive = Date.now() >= gameStartTime;
+      const maxSharesLimit = isLive ? config.maxSharesInGame : config.maxSharesPreGame;
+      const maxDollarLimit = isLive ? config.maxPerMarketInGame : config.maxPerMarketPreGame;
+      const limitType = isLive ? "in-game" : "pre-game";
+
+      // Check max shares per market (pre-game vs in-game)
       const currentShares = getSharesOnToken(userId, bet.polymarketTokenId);
-      const remainingShares = config.maxSharesPerMarket - currentShares;
+      const remainingShares = maxSharesLimit - currentShares;
       if (remainingShares <= 0) {
-        return { success: false, error: `Max shares per market reached (${config.maxSharesPerMarket})` };
+        return { success: false, error: `Max ${limitType} shares reached (${currentShares}/${maxSharesLimit})` };
       }
       if (shares > remainingShares) {
         shares = remainingShares;
         betSize = shares * bet.polymarketPrice;
       }
 
-      // Check max per market (dollar limit) - applies to share-based sizing too
+      // Check max per market (dollar limit) - pre-game vs in-game
       const currentDollarExposure = getExposureOnToken(userId, bet.polymarketTokenId);
-      const remainingDollarAllowance = config.maxPerMarket - currentDollarExposure;
+      const remainingDollarAllowance = maxDollarLimit - currentDollarExposure;
       if (remainingDollarAllowance <= 0) {
-        return { success: false, error: `Max per market reached ($${currentDollarExposure.toFixed(0)}/$${config.maxPerMarket})` };
+        return { success: false, error: `Max ${limitType} allocation reached ($${currentDollarExposure.toFixed(0)}/$${maxDollarLimit})` };
       }
       if (betSize > remainingDollarAllowance) {
         betSize = remainingDollarAllowance;
         shares = betSize / bet.polymarketPrice;
         if (shares < 1) {
-          return { success: false, error: `Max per market reached ($${currentDollarExposure.toFixed(0)}/$${config.maxPerMarket})` };
+          return { success: false, error: `Max ${limitType} allocation reached ($${currentDollarExposure.toFixed(0)}/$${maxDollarLimit})` };
         }
       }
 
@@ -1922,43 +2209,30 @@ async function executeValueBet(
         return { success: false, error: `Exposure limit reached ($${currentTotalExposure.toFixed(0)}/$${maxExposure.toFixed(0)}, $${available.toFixed(0)} available)` };
       }
 
+      // Determine if game is live for allocation limits
+      const gameStart = new Date(bet.commenceTime).getTime();
+      const gameLive = Date.now() >= gameStart;
+      const dollarLimit = gameLive ? config.maxPerMarketInGame : config.maxPerMarketPreGame;
+      const allocationType = gameLive ? "in-game" : "pre-game";
+
       // Check max per market (total exposure on this outcome)
       const currentExposure = getExposureOnToken(userId, bet.polymarketTokenId);
-      const remainingAllowance = config.maxPerMarket - currentExposure;
+      const remainingAllowance = dollarLimit - currentExposure;
       if (remainingAllowance <= 0) {
-        return { success: false, error: `Max per market reached ($${config.maxPerMarket})` };
+        return { success: false, error: `Max ${allocationType} allocation reached ($${dollarLimit})` };
       }
       if (betSize > remainingAllowance) {
         betSize = remainingAllowance;
       }
       if (betSize < config.minBetUsd) {
-        return { success: false, error: `Bet size below minimum after max per market adjustment` };
+        return { success: false, error: `Bet size below minimum after max ${allocationType} adjustment` };
       }
 
       shares = betSize / bet.polymarketPrice;
     }
 
-    // Check position cost limit for arbitrage safety
-    // Allow betting both sides as long as total cost stays under $1.00 (guaranteed profit zone)
-    if (bet.polymarketConditionId) {
-      const costCheck = wouldExceedPositionCostLimit(userId, bet.polymarketConditionId, betSize);
-
-      if (costCheck.blocked) {
-        logger.warn(
-          `Position cost limit: ${bet.outcome} would bring total to $${costCheck.newTotalCost.toFixed(2)} ` +
-          `(current: $${costCheck.currentCost.toFixed(2)}, adding: $${betSize.toFixed(2)})`
-        );
-        return { success: false, error: `Position cost would exceed $1.00 (${costCheck.newTotalCost.toFixed(2)})` };
-      }
-
-      // Log arbitrage opportunity if betting the other side
-      if (costCheck.currentCost > 0 && costCheck.potentialProfit > 0) {
-        logger.info(
-          `Arbitrage building: ${bet.outcome} - total cost $${costCheck.newTotalCost.toFixed(2)} → ` +
-          `potential profit $${costCheck.potentialProfit.toFixed(2)} (${((costCheck.potentialProfit / costCheck.newTotalCost) * 100).toFixed(1)}%)`
-        );
-      }
-    }
+    // Log detailed EV breakdown before placing bet
+    logBetEvBreakdown(bet, betSize, shares, config);
 
     // Place market order - amount is in USD for BUY orders
     const result = await tradingService.placeMarketOrder(client, {
@@ -1972,8 +2246,8 @@ async function executeValueBet(
       recordSportsBet(userId, bet, betSize, shares, result.orderId || "");
       logger.success(`Sports bet placed: ${bet.outcome} @ ${(bet.polymarketPrice * 100).toFixed(0)}¢, $${betSize.toFixed(2)} (${shares.toFixed(1)} shares)`);
 
-      // Send Telegram notification
-      await notifyBetPlaced(userId, bet, betSize);
+      // Send Telegram notification with full EV breakdown
+      await notifyBetPlaced(userId, bet, betSize, shares, config);
     }
 
     return result;
@@ -1983,7 +2257,7 @@ async function executeValueBet(
   }
 }
 
-async function notifyBetPlaced(userId: number, bet: ValueBet, betSize: number): Promise<void> {
+async function notifyBetPlaced(userId: number, bet: ValueBet, betSize: number, shares: number, config: SportsConfig): Promise<void> {
   try {
     const user = await userRepo.findById(userId);
     if (!user?.telegram_chat_id) return;
@@ -2008,16 +2282,19 @@ async function notifyBetPlaced(userId: number, bet: ValueBet, betSize: number): 
     await sendMessage(user.telegram_chat_id, message, { parseMode: "Markdown" });
 
     // Also post to the public channel if configured
-    await postSportsBetToChannel(bet, betSize);
+    await postSportsBetToChannel(bet, betSize, shares, config);
+
+    // Save bet report JSON for dashboard
+    saveBetReport(bet, betSize, shares, config);
   } catch (error) {
     logger.error("Failed to send sports bet notification", error);
   }
 }
 
 /**
- * Post sports bet to the public channel (similar to copy trade notifications)
+ * Post sports bet to the public channel with full EV breakdown
  */
-async function postSportsBetToChannel(bet: ValueBet, betSize: number): Promise<void> {
+async function postSportsBetToChannel(bet: ValueBet, betSize: number, shares: number, config: SportsConfig): Promise<void> {
   const channelId = process.env.TELEGRAM_CHAT_ID;
   if (!channelId) return;
 
@@ -2033,36 +2310,71 @@ async function postSportsBetToChannel(bet: ValueBet, betSize: number): Promise<v
                           bet.edge >= 0.07 ? "🔥" :
                           bet.edge >= 0.05 ? "✨" : "";
 
-    // Calculate shares
-    const shares = betSize / bet.polymarketPrice;
+    const minEdgePct = ((bet.dynamicMinEdge || config.minEdge) * 100).toFixed(1);
 
-    // Build book breakdown
-    let bookBreakdown = "";
-    if (bet.bookData && bet.bookData.length > 0) {
-      const bookLines = bet.bookData.map(b => {
-        const oddsStr = b.odds > 0 ? `+${b.odds}` : `${b.odds}`;
-        return `  ${b.key}: ${oddsStr} → ${(b.rawProb * 100).toFixed(1)}% raw → ${(b.fairProb * 100).toFixed(1)}% fair (${b.vig.toFixed(1)}% vig)`;
-      });
-      bookBreakdown = bookLines.join("\n");
+    // Build Polymarket prices section (both sides)
+    let polySection = `▸ *${bet.outcome}*: ${(bet.polymarketPrice * 100).toFixed(1)}¢ ← BET`;
+    if (bet.otherSide) {
+      polySection += `\n▹ ${bet.otherSide.outcome}: ${(bet.otherSide.polymarketPrice * 100).toFixed(1)}¢`;
+      const totalPoly = bet.polymarketPrice + bet.otherSide.polymarketPrice;
+      polySection += `\n▹ _Total: ${(totalPoly * 100).toFixed(1)}¢_`;
     }
 
+    // Build sharp consensus section (both sides)
+    let sharpSection = `▸ *${bet.outcome}*: ${(bet.sharpProb * 100).toFixed(1)}%`;
+    if (bet.otherSide) {
+      sharpSection += `\n▹ ${bet.otherSide.outcome}: ${(bet.otherSide.sharpProb * 100).toFixed(1)}%`;
+    }
+
+    // Build book breakdown for betting side
+    let bookBreakdown = "";
+    if (bet.bookData && bet.bookData.length > 0) {
+      bookBreakdown = `\n_${bet.outcome}:_\n`;
+      bookBreakdown += bet.bookData.map(b => {
+        const oddsStr = b.odds > 0 ? `+${b.odds}` : `${b.odds}`;
+        return `  \`${b.key.padEnd(10)}\` ${oddsStr.padStart(5)} → ${(b.fairProb * 100).toFixed(1)}%`;
+      }).join("\n");
+    }
+
+    // Build book breakdown for other side
+    if (bet.otherSide?.bookData && bet.otherSide.bookData.length > 0) {
+      bookBreakdown += `\n\n_${bet.otherSide.outcome}:_\n`;
+      bookBreakdown += bet.otherSide.bookData.map(b => {
+        const oddsStr = b.odds > 0 ? `+${b.odds}` : `${b.odds}`;
+        return `  \`${b.key.padEnd(10)}\` ${oddsStr.padStart(5)} → ${(b.fairProb * 100).toFixed(1)}%`;
+      }).join("\n");
+    }
+
+    // Build edge section (both sides)
+    let edgeSection = `▸ *${bet.outcome}*: *+${(bet.edge * 100).toFixed(2)}%* ✓`;
+    if (bet.otherSide) {
+      const otherEdge = bet.otherSide.edge;
+      const otherEdgeSign = otherEdge >= 0 ? "+" : "";
+      const otherCheck = otherEdge >= (bet.dynamicMinEdge || config.minEdge) ? "✓" : "✗";
+      edgeSection += `\n▹ ${bet.otherSide.outcome}: ${otherEdgeSign}${(otherEdge * 100).toFixed(2)}% ${otherCheck}`;
+    }
+    edgeSection += `\n▹ _Min required: ${minEdgePct}%_`;
+
     const message = [
-      `${sportIcon} *Sports Value Bet* ${edgeIndicator}`,
+      `${sportIcon} *SPORTS VALUE BET* ${edgeIndicator}`,
       ``,
       `*${bet.homeTeam} vs ${bet.awayTeam}*`,
-      `Bet: *${bet.outcome}*`,
       ``,
-      `*Order:*`,
-      `• Size: $${betSize.toFixed(2)} (${shares.toFixed(1)} shares)`,
-      `• Poly price: ${(bet.polymarketPrice * 100).toFixed(0)}¢`,
+      `━━━ *POLYMARKET* ━━━`,
+      polySection,
       ``,
-      `*Sharp Book Odds (de-vigged):*`,
-      bookBreakdown || "  No book data",
+      `━━━ *SHARP CONSENSUS* (${bet.bookmakerConsensus} books) ━━━`,
+      sharpSection,
+      bookBreakdown,
       ``,
-      `*EV Calculation:*`,
-      `• Avg fair prob: ${(bet.sharpProb * 100).toFixed(1)}% = ${(bet.sharpProb * 100).toFixed(1)}¢ EV`,
-      `• Poly price: ${(bet.polymarketPrice * 100).toFixed(0)}¢`,
-      `• Edge: (${(bet.sharpProb * 100).toFixed(1)} - ${(bet.polymarketPrice * 100).toFixed(0)}) / ${(bet.polymarketPrice * 100).toFixed(0)} = *+${(bet.edge * 100).toFixed(1)}%*`,
+      `━━━ *EDGE* ━━━`,
+      edgeSection,
+      ``,
+      `━━━ *ORDER* ━━━`,
+      `▸ ${shares.toFixed(1)} shares @ ${(bet.polymarketPrice * 100).toFixed(1)}¢`,
+      `▸ Cost: *$${betSize.toFixed(2)}*`,
+      `▸ Payout if win: $${shares.toFixed(2)}`,
+      `▸ EV: $${(shares * bet.edge).toFixed(2)}`,
       ``,
       `[View on Polymarket](https://polymarket.com/event/${bet.polymarketSlug || bet.polymarketConditionId})`,
     ].join("\n");
@@ -2071,6 +2383,121 @@ async function postSportsBetToChannel(bet: ValueBet, betSize: number): Promise<v
     logger.debug(`Posted sports bet to channel: ${bet.outcome}`);
   } catch (error) {
     logger.error("Failed to post sports bet to channel", error);
+  }
+}
+
+/**
+ * Save bet report as JSON for dashboard
+ */
+function saveBetReport(bet: ValueBet, betSize: number, shares: number, config: SportsConfig): void {
+  try {
+    const reportDir = join(process.cwd(), "data", "bet-reports");
+    if (!existsSync(reportDir)) {
+      mkdirSync(reportDir, { recursive: true });
+    }
+
+    const report = {
+      id: bet.id,
+      timestamp: Date.now(),
+      timestampISO: new Date().toISOString(),
+      match: {
+        homeTeam: bet.homeTeam,
+        awayTeam: bet.awayTeam,
+        sport: bet.sport,
+        commenceTime: bet.commenceTime,
+      },
+      bet: {
+        outcome: bet.outcome,
+        shares,
+        cost: betSize,
+        pricePerShare: bet.polymarketPrice,
+        tokenId: bet.polymarketTokenId,
+        conditionId: bet.polymarketConditionId,
+        slug: bet.polymarketSlug,
+      },
+      polymarket: {
+        bettingSide: {
+          outcome: bet.outcome,
+          price: bet.polymarketPrice,
+        },
+        otherSide: bet.otherSide ? {
+          outcome: bet.otherSide.outcome,
+          price: bet.otherSide.polymarketPrice,
+        } : null,
+        totalPrice: bet.otherSide ? bet.polymarketPrice + bet.otherSide.polymarketPrice : null,
+      },
+      sharpConsensus: {
+        bettingSide: {
+          outcome: bet.outcome,
+          fairProb: bet.sharpProb,
+          bookCount: bet.bookmakerConsensus,
+          variance: bet.consensusVariance,
+          books: bet.bookData?.map(b => ({
+            key: b.key,
+            odds: b.odds,
+            rawProb: b.rawProb,
+            fairProb: b.fairProb,
+            vig: b.vig,
+          })),
+        },
+        otherSide: bet.otherSide ? {
+          outcome: bet.otherSide.outcome,
+          fairProb: bet.otherSide.sharpProb,
+          books: bet.otherSide.bookData?.map(b => ({
+            key: b.key,
+            odds: b.odds,
+            rawProb: b.rawProb,
+            fairProb: b.fairProb,
+            vig: b.vig,
+          })),
+        } : null,
+      },
+      edge: {
+        bettingSide: {
+          outcome: bet.outcome,
+          edge: bet.edge,
+          edgePct: (bet.edge * 100).toFixed(2) + "%",
+        },
+        otherSide: bet.otherSide ? {
+          outcome: bet.otherSide.outcome,
+          edge: bet.otherSide.edge,
+          edgePct: (bet.otherSide.edge * 100).toFixed(2) + "%",
+        } : null,
+        minRequired: bet.dynamicMinEdge || config.minEdge,
+        minRequiredPct: ((bet.dynamicMinEdge || config.minEdge) * 100).toFixed(1) + "%",
+      },
+      expectedValue: {
+        perShare: bet.edge,
+        total: shares * bet.edge,
+        totalFormatted: "$" + (shares * bet.edge).toFixed(2),
+      },
+      payout: {
+        ifWin: shares,
+        ifWinFormatted: "$" + shares.toFixed(2),
+        profit: shares - betSize,
+        profitFormatted: "$" + (shares - betSize).toFixed(2),
+      },
+    };
+
+    // Save individual report
+    const filename = `bet-${Date.now()}-${bet.id.replace(/[^a-zA-Z0-9]/g, "-")}.json`;
+    writeFileSync(join(reportDir, filename), JSON.stringify(report, null, 2));
+
+    // Also append to latest bets file (keep last 50)
+    const latestFile = join(process.cwd(), "data", "sports-latest-bets.json");
+    let latestBets: any[] = [];
+    try {
+      if (existsSync(latestFile)) {
+        latestBets = JSON.parse(Bun.file(latestFile).text() as unknown as string);
+      }
+    } catch { /* ignore */ }
+    latestBets.unshift(report);
+    latestBets = latestBets.slice(0, 50); // Keep last 50
+    writeFileSync(latestFile, JSON.stringify(latestBets, null, 2));
+
+    logger.debug(`Saved bet report: ${filename}`);
+  } catch (error) {
+    logger.error("Failed to save bet report", error);
   }
 }
 
@@ -2193,6 +2620,164 @@ export function recordSportsBet(
 				}
   } catch (error) {
     logger.error("Failed to record sports bet", error);
+  }
+}
+
+/**
+ * Save odds data to database for dashboard display
+ */
+export function saveOddsToDatabase(bet: ValueBet): void {
+  try {
+    db().prepare(`
+      INSERT INTO sports_odds (
+        match_id, sport, home_team, away_team, commence_time,
+        poly_slug, poly_condition_id,
+        poly_home_price, poly_away_price,
+        poly_home_token_id, poly_away_token_id,
+        sharp_home_prob, sharp_away_prob,
+        book_count, variance,
+        home_edge, away_edge, min_edge_required,
+        home_book_data, away_book_data,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(match_id) DO UPDATE SET
+        poly_home_price = excluded.poly_home_price,
+        poly_away_price = excluded.poly_away_price,
+        sharp_home_prob = excluded.sharp_home_prob,
+        sharp_away_prob = excluded.sharp_away_prob,
+        book_count = excluded.book_count,
+        variance = excluded.variance,
+        home_edge = excluded.home_edge,
+        away_edge = excluded.away_edge,
+        min_edge_required = excluded.min_edge_required,
+        home_book_data = excluded.home_book_data,
+        away_book_data = excluded.away_book_data,
+        updated_at = excluded.updated_at
+    `).run(
+      bet.matchId,
+      bet.sport,
+      bet.homeTeam,
+      bet.awayTeam,
+      bet.commenceTime,
+      bet.polymarketSlug || null,
+      bet.polymarketConditionId,
+      // If betting home team, use bet data for home, otherSide for away
+      // If betting away team, use otherSide for home, bet data for away
+      bet.outcome === bet.homeTeam ? bet.polymarketPrice : (bet.otherSide?.polymarketPrice || null),
+      bet.outcome === bet.awayTeam ? bet.polymarketPrice : (bet.otherSide?.polymarketPrice || null),
+      bet.outcome === bet.homeTeam ? bet.polymarketTokenId : null,
+      bet.outcome === bet.awayTeam ? bet.polymarketTokenId : null,
+      bet.outcome === bet.homeTeam ? bet.sharpProb : (bet.otherSide?.sharpProb || null),
+      bet.outcome === bet.awayTeam ? bet.sharpProb : (bet.otherSide?.sharpProb || null),
+      bet.bookmakerConsensus,
+      bet.consensusVariance || null,
+      bet.outcome === bet.homeTeam ? bet.edge : (bet.otherSide?.edge || null),
+      bet.outcome === bet.awayTeam ? bet.edge : (bet.otherSide?.edge || null),
+      bet.dynamicMinEdge || null,
+      bet.outcome === bet.homeTeam ? JSON.stringify(bet.bookData || []) : JSON.stringify(bet.otherSide?.bookData || []),
+      bet.outcome === bet.awayTeam ? JSON.stringify(bet.bookData || []) : JSON.stringify(bet.otherSide?.bookData || []),
+      Math.floor(Date.now() / 1000)
+    );
+  } catch (error) {
+    logger.error("Failed to save odds to database", error);
+  }
+}
+
+/**
+ * Save all odds from a poll cycle to the database
+ */
+export function saveAllOddsToDatabase(valueBets: ValueBet[]): void {
+  for (const bet of valueBets) {
+    saveOddsToDatabase(bet);
+  }
+}
+
+/**
+ * Save odds directly to database (for ALL games, not just value bets)
+ */
+export function saveOddsToDbDirect(data: {
+  matchId: string;
+  sport: string;
+  homeTeam: string;
+  awayTeam: string;
+  commenceTime: string;
+  polySlug?: string;
+  polyConditionId?: string;
+  polyHomePrice: number;
+  polyAwayPrice: number;
+  polyHomeTokenId?: string;
+  polyAwayTokenId?: string;
+  sharpHomeProb: number | null;
+  sharpAwayProb: number | null;
+  bookCount: number;
+  variance: number | null;
+  homeEdge: number | null;
+  awayEdge: number | null;
+  minEdgeRequired: number;
+  homeBookData: any[];
+  awayBookData: any[];
+  homeExcludedBooks?: any[];
+  awayExcludedBooks?: any[];
+}): void {
+  try {
+    db().prepare(`
+      INSERT INTO sports_odds (
+        match_id, sport, home_team, away_team, commence_time,
+        poly_slug, poly_condition_id,
+        poly_home_price, poly_away_price,
+        poly_home_token_id, poly_away_token_id,
+        sharp_home_prob, sharp_away_prob,
+        book_count, variance,
+        home_edge, away_edge, min_edge_required,
+        home_book_data, away_book_data,
+        home_excluded_books, away_excluded_books,
+        updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(match_id) DO UPDATE SET
+        poly_home_price = excluded.poly_home_price,
+        poly_away_price = excluded.poly_away_price,
+        sharp_home_prob = excluded.sharp_home_prob,
+        sharp_away_prob = excluded.sharp_away_prob,
+        book_count = excluded.book_count,
+        variance = excluded.variance,
+        home_edge = excluded.home_edge,
+        away_edge = excluded.away_edge,
+        min_edge_required = excluded.min_edge_required,
+        home_book_data = excluded.home_book_data,
+        away_book_data = excluded.away_book_data,
+        home_excluded_books = excluded.home_excluded_books,
+        away_excluded_books = excluded.away_excluded_books,
+        updated_at = excluded.updated_at
+    `).run(
+      data.matchId,
+      data.sport,
+      data.homeTeam,
+      data.awayTeam,
+      data.commenceTime,
+      data.polySlug || null,
+      data.polyConditionId || null,
+      data.polyHomePrice,
+      data.polyAwayPrice,
+      data.polyHomeTokenId || null,
+      data.polyAwayTokenId || null,
+      data.sharpHomeProb,
+      data.sharpAwayProb,
+      data.bookCount,
+      data.variance,
+      data.homeEdge,
+      data.awayEdge,
+      data.minEdgeRequired,
+      JSON.stringify(data.homeBookData),
+      JSON.stringify(data.awayBookData),
+      JSON.stringify(data.homeExcludedBooks || []),
+      JSON.stringify(data.awayExcludedBooks || []),
+      Math.floor(Date.now() / 1000)
+    );
+    logger.info(`Saved odds to DB: ${data.homeTeam} vs ${data.awayTeam}`);
+  } catch (error) {
+    logger.error("Failed to save odds to database", error);
   }
 }
 
@@ -2585,142 +3170,6 @@ async function notifySellExecuted(userId: number, bet: OpenBet, sellPrice: numbe
   }
 }
 
-/**
- * Trim over-exposed positions back to maxPerMarket limit
- * Only sells if we're in profit or break-even (won't sell at a loss)
- */
-async function trimOverExposedPosition(
-	userId: number,
-	bet: OpenBet,
-	config: SportsConfig,
-): Promise<boolean> {
-	// Calculate current position value
-	const currentValue = bet.shares * bet.buyPrice; // Cost basis
-
-	// Check if over limit by more than 20%
-	const overExposedThreshold = config.maxPerMarket * 1.2; // 20% buffer
-	if (currentValue <= overExposedThreshold) {
-		return false; // Not significantly over-exposed
-	}
-
-	// Only trim before game starts (not during live games)
-	const now = Math.floor(Date.now() / 1000);
-	if (bet.commenceTime && bet.commenceTime <= now) {
-		logger.debug(
-			`Not trimming ${bet.outcome}: game has already started`,
-		);
-		return false;
-	}
-
-	// Get current market price
-	const wallet = copyService.getTradingWallet(userId);
-	if (!wallet || !wallet.encryptedCredentials) {
-		return false;
-	}
-
-	try {
-		const credentials = decryptCredentials(wallet.encryptedCredentials);
-		const client = await tradingService.createClobClient(
-			(credentials as any).privateKey,
-			{
-				apiKey: credentials.apiKey,
-				apiSecret: credentials.apiSecret,
-				passphrase: credentials.passphrase,
-			},
-			wallet.proxyAddress || undefined,
-		);
-
-		// Get current bid price
-		const book = await client.getOrderBook(bet.tokenId);
-		const bids = book?.bids;
-		if (!bids || bids.length === 0) {
-			return false; // No liquidity
-		}
-		// Find best bid by explicitly getting the max price (don't assume sort order)
-		const bestBid = bids.reduce((max, bid) =>
-			parseFloat(bid.price) > parseFloat(max.price) ? bid : max
-		);
-		const bidPrice = parseFloat(bestBid.price);
-
-		// Only sell if we're not losing more than 10%
-		const profitPct = (bidPrice - bet.buyPrice) / bet.buyPrice;
-		if (profitPct < -0.1) {
-			logger.debug(
-				`Not trimming ${bet.outcome}: would lose ${(profitPct * 100).toFixed(1)}% (> 10% threshold)`,
-			);
-			return false; // Don't sell at significant loss
-		}
-
-		// Calculate how much to sell to get back to limit
-		const excessValue = currentValue - config.maxPerMarket;
-		const sharesToSell = Math.min(excessValue / bidPrice, bet.shares * 0.5); // Max 50% at a time
-
-		if (sharesToSell < 1) {
-			return false; // Not enough to sell
-		}
-
-		logger.info(
-			`Trimming over-exposed position: ${bet.outcome} - selling ${sharesToSell.toFixed(0)} shares ($${(sharesToSell * bidPrice).toFixed(2)}) to reduce exposure`,
-		);
-
-		// Execute partial sell
-		const result = await tradingService.placeMarketOrder(client, {
-			tokenId: bet.tokenId,
-			side: "SELL",
-			amount: sharesToSell,
-		});
-
-		if (result.success) {
-			// Update the bet record with reduced size
-			const newShares = bet.shares - sharesToSell;
-			const newSize = newShares * bet.buyPrice;
-			const soldProceeds = sharesToSell * bidPrice;
-			const soldProfit = soldProceeds - sharesToSell * bet.buyPrice;
-
-			db()
-				.prepare(`
-        UPDATE sports_bets SET shares = ?, size = ? WHERE id = ?
-      `)
-				.run(newShares, newSize, bet.id);
-
-			logger.success(
-				`Trimmed ${bet.outcome}: -${sharesToSell.toFixed(0)} shares, P&L: $${soldProfit.toFixed(2)}`,
-			);
-
-			// Notify user
-			const user = await userRepo.findById(userId);
-			if (user?.telegram_chat_id) {
-				const overPct = ((currentValue / config.maxPerMarket - 1) * 100).toFixed(0);
-				await sendMessage(
-					user.telegram_chat_id,
-					`✂️ *Position Trimmed*\n\n` +
-						`*${bet.outcome}*\n` +
-						`Sold ${sharesToSell.toFixed(0)} shares @ ${(bidPrice * 100).toFixed(0)}¢\n` +
-						`P&L: ${soldProfit >= 0 ? "+" : ""}$${soldProfit.toFixed(2)}\n` +
-						`Reason: ${overPct}% over max ($${config.maxPerMarket})`,
-					{ parseMode: "Markdown" },
-				);
-			}
-
-			return true;
-		}
-
-		return false;
-	} catch (error: any) {
-		// Check if market no longer exists (404 = resolved/delisted)
-		// Axios errors have response.status and response.data.error
-		const status = error?.response?.status || error?.status;
-		const dataError = error?.response?.data?.error || "";
-		const is404 = status === 404 || dataError.includes("No orderbook exists");
-		if (is404) {
-			logger.info(`Market closed for ${bet.outcome} - marking as resolved`);
-			db().prepare(`UPDATE sports_bets SET status = 'resolved' WHERE id = ?`).run(bet.id);
-			return false;
-		}
-		logger.error("Failed to trim over-exposed position", error);
-		return false;
-	}
-}
 
 /**
  * Execute a take-profit sell when price exceeds maxHoldPrice
